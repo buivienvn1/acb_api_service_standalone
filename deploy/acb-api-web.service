@@ -1,0 +1,16 @@
+[Unit]
+Description=Standalone ACB API web service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=acb-api
+Group=acb-api
+WorkingDirectory=/opt/acb-api
+EnvironmentFile=/opt/acb-api/.env
+ExecStart=/opt/acb-api/venv/bin/python -m uvicorn acb_api_service.app:app --host 127.0.0.1 --port 8091 --workers 1 --no-access-log
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

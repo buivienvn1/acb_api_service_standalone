@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="vi">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width">
+    <title>ACB API Admin</title>
+    <style>
+        body {
+            font: 16px system-ui;
+            max-width: 420px;
+            margin: 10vh auto;
+            padding: 1rem;
+            background: #f5f7fa
+        }
+
+        main {
+            background: white;
+            padding: 2rem;
+            border-radius: 12px
+        }
+
+        label,
+        input,
+        button {
+            display: block;
+            width: 100%;
+            box-sizing: border-box;
+            margin: .6rem 0
+        }
+
+        input,
+        button {
+            padding: .75rem
+        }
+
+        button {
+            background: #075985;
+            color: white;
+            border: 0;
+            border-radius: 6px
+        }
+
+        .error {
+            color: #b91c1c
+        }
+    </style>
+</head>
+
+<body>
+    <main>
+        <h1>ACB API Admin</h1>{% if error %}<p class="error">{{ error }}</p>{% endif %}<form method="post"
+            action="/admin/login"><label>Tài khoản<input name="username" autocomplete="username"
+                    required></label><label>Mật khẩu<input type="password" name="password"
+                    autocomplete="current-password" required></label><button>Đăng nhập</button></form>
+    </main>
+</body>
+
+</html>

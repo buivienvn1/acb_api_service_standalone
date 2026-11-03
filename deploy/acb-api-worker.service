@@ -1,0 +1,16 @@
+[Unit]
+Description=Standalone ACB API polling worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=acb-api
+Group=acb-api
+WorkingDirectory=/opt/acb-api
+EnvironmentFile=/opt/acb-api/.env
+ExecStart=/opt/acb-api/venv/bin/python -m acb_api_service.worker
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

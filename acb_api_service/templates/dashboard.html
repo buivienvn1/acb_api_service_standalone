@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="vi">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width">
+    <title>Khách hàng ACB API</title>
+    <style>
+        body {
+            font: 15px system-ui;
+            max-width: 1100px;
+            margin: auto;
+            padding: 1rem;
+            color: #172033
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse
+        }
+
+        th,
+        td {
+            padding: .65rem;
+            border-bottom: 1px solid #ddd;
+            text-align: left
+        }
+
+        form.card {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: .7rem;
+            background: #f5f7fa;
+            padding: 1rem;
+            border-radius: 10px
+        }
+
+        label,
+        input,
+        button {
+            display: block;
+            width: 100%;
+            box-sizing: border-box
+        }
+
+        input,
+        button {
+            padding: .6rem
+        }
+
+        button {
+            background: #075985;
+            color: white;
+            border: 0;
+            border-radius: 5px
+        }
+
+        .danger {
+            background: #991b1b
+        }
+
+        .muted {
+            color: #64748b
+        }
+    </style>
+</head>
+
+<body>
+    <header>
+        <h1>Khách hàng</h1>
+        <form method="post" action="/admin/logout"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button
+                class="danger">Đăng xuất</button></form>
+    </header>
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Tên</th>
+                <th>Tài khoản</th>
+                <th>Hết hạn</th>
+                <th>Trạng thái</th>
+                <th>Đồng bộ</th>
+            </tr>
+        </thead>
+        <tbody>{% for c in customers %}<tr>
+                <td><a href="/admin/customers/{{ c.id }}">{{ c.id }}</a></td>
+                <td>{{ c.name }}</td>
+                <td>••••{{ c.account_number[-4:] }}</td>
+                <td>{{ c.expires_at or 'Không giới hạn' }}</td>
+                <td>{{ 'Khóa' if c.locked else 'Mở' }}</td>
+                <td>{{ c.last_sync_ok_at or 'Chưa có' }}</td>
+            </tr>{% else %}<tr>
+                <td colspan="6" class="muted">Chưa có khách hàng.</td>
+            </tr>{% endfor %}</tbody>
+    </table>
+    <h2>Thêm khách hàng</h2>
+    <form class="card" method="post" action="/admin/customers"><input type="hidden" name="csrf_token"
+            value="{{ csrf }}"><label>Tên<input name="name" maxlength="200" required></label><label>Số tài khoản
+            ACB<input name="account_number" maxlength="64" required></label><label>ACB username<input name="username"
+                autocomplete="off" required></label><label>ACB password<input type="password" name="password"
+                autocomplete="new-password" required></label><label>Hết hạn (ISO UTC)<input name="expires_at"
+                placeholder="2027-01-01T00:00:00+00:00"></label>
+        <div><button>Tạo</button></div>
+    </form>
+</body>
+
+</html>

@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="vi">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width">
+    <title>{{ customer.name }}</title>
+    <style>
+        body {
+            font: 15px system-ui;
+            max-width: 1200px;
+            margin: auto;
+            padding: 1rem;
+            color: #172033
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse
+        }
+
+        th,
+        td {
+            padding: .55rem;
+            border-bottom: 1px solid #ddd;
+            text-align: left;
+            overflow-wrap: anywhere
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: .7rem;
+            background: #f5f7fa;
+            padding: 1rem
+        }
+
+        label,
+        input,
+        button {
+            display: block;
+            width: 100%;
+            box-sizing: border-box
+        }
+
+        input,
+        button {
+            padding: .55rem
+        }
+
+        button {
+            background: #075985;
+            color: #fff;
+            border: 0;
+            border-radius: 5px
+        }
+
+        .danger {
+            background: #991b1b
+        }
+
+        .warn {
+            background: #fef3c7;
+            padding: 1rem
+        }
+
+        .key {
+            background: #dcfce7;
+            padding: 1rem;
+            overflow-wrap: anywhere
+        }
+
+        .actions {
+            display: flex;
+            gap: .7rem
+        }
+
+        .actions form {
+            flex: 1
+        }
+    </style>
+</head>
+
+<body>
+    <p><a href="/admin">← Danh sách</a></p>
+    <h1>{{ customer.name }}</h1>{% if stale %}<p class="warn">Dữ liệu đang stale hoặc chưa đồng bộ. {% if
+        customer.last_sync_error %}Lần đồng bộ lỗi: {{ customer.last_sync_error }}.{% endif %} Kết quả lịch sử có thể
+        chưa đầy đủ.</p>{% endif %}{% if new_key %}<div class="key"><strong>API key chỉ hiển thị trong response
+            này:</strong><br><code>{{ new_key }}</code></div>{% endif %}{% if feed_url %}<div class="key"><strong>Feed
+            link bí mật:</strong><br><input id="feed-url" readonly value="{{ feed_url }}"><button type="button"
+            onclick="navigator.clipboard.writeText(document.getElementById('feed-url').value)">Copy link</button></div>
+    {% endif %}<h2>Cấu hình</h2>
+    <form class="grid" method="post" action="/admin/customers/{{ customer.id }}/update"><input type="hidden"
+            name="csrf_token" value="{{ csrf }}"><label>Tên<input name="name" value="{{ customer.name }}"
+                required></label><label>Số tài khoản<input name="account_number" value="{{ customer.account_number }}"
+                required></label><label>Username mới (để trống giữ nguyên)<input name="username"
+                autocomplete="off"></label><label>Password mới (để trống giữ nguyên)<input type="password"
+                name="password" autocomplete="new-password"></label><label>Hết hạn<input name="expires_at"
+                value="{{ customer.expires_at or '' }}"></label><label><input type="checkbox" name="locked" value="1" {%
+                if customer.locked %}checked{% endif %}> Khóa dịch vụ</label><button>Lưu cấu hình</button></form>
+    <h2>API key</h2>
+    <p>{% if active_key %}Active: <code>{{ active_key.key_prefix }}…</code>, tạo {{ active_key.created_at }}, dùng gần
+        nhất {{ active_key.last_used_at or 'chưa dùng' }}{% else %}Chưa có key active.{% endif %}</p>
+    <div class="actions">
+        <form method="post" action="/admin/customers/{{ customer.id }}/key"><input type="hidden" name="csrf_token"
+                value="{{ csrf }}"><button>{{ 'Rotate key' if active_key else 'Cấp key' }}</button></form>{% if
+        active_key %}<form method="post" action="/admin/customers/{{ customer.id }}/key/revoke"><input type="hidden"
+                name="csrf_token" value="{{ csrf }}"><button class="danger">Revoke</button></form>{% endif %}<form
+            method="post" action="/admin/customers/{{ customer.id }}/test"><input type="hidden" name="csrf_token"
+                value="{{ csrf }}"><button>Test kết nối (cooldown 60s)</button></form>
+    </div>
+    <h2>Feed link đọc giao dịch</h2>
+    <p>{% if active_feed %}Active: <code>{{ active_feed.token_prefix }}…</code>, tạo {{ active_feed.created_at }}, dùng
+        gần nhất {{ active_feed.last_used_at or 'chưa dùng' }}. Token được che mặc định.{% else %}Chưa có feed link
+        active.{% endif %}</p>
+    <div class="actions">
+        <form method="post" action="/admin/customers/{{ customer.id }}/feed"><input type="hidden" name="csrf_token"
+                value="{{ csrf }}"><button>{{ 'Rotate link' if active_feed else 'Cấp link' }}</button></form>
+        {% if active_feed %}<form method="post" action="/admin/customers/{{ customer.id }}/feed/reveal"><input
+                type="hidden" name="csrf_token" value="{{ csrf }}"><button>Reveal / Copy</button></form>
+        <form method="post" action="/admin/customers/{{ customer.id }}/feed/revoke"><input type="hidden"
+                name="csrf_token" value="{{ csrf }}"><button class="danger">Revoke link</button></form>{% endif %}
+    </div>
+    <h2>Giao dịch gần nhất</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Mã ACB</th>
+                <th>Số tiền</th>
+                <th>Loại</th>
+                <th>Thời gian</th>
+                <th>Nội dung</th>
+            </tr>
+        </thead>
+        <tbody>{% for tx in transactions %}<tr>
+                <td>{{ tx.id }}</td>
+                <td>{{ tx.external_id }}</td>
+                <td>{{ tx.amount }}</td>
+                <td>{{ tx.transaction_type }}</td>
+                <td>{{ tx.transacted_at }}</td>
+                <td>{{ tx.description }}</td>
+            </tr>{% else %}<tr>
+                <td colspan="6">Chưa có dữ liệu.</td>
+            </tr>{% endfor %}</tbody>
+    </table>
+    <h2>Audit log</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Thời gian</th>
+                <th>Hành động</th>
+                <th>IP</th>
+                <th>Chi tiết</th>
+            </tr>
+        </thead>
+        <tbody>{% for a in audits %}<tr>
+                <td>{{ a.created_at }}</td>
+                <td>{{ a.action }}</td>
+                <td>{{ a.remote_ip }}</td>
+                <td>{{ a.details }}</td>
+            </tr>{% endfor %}</tbody>
+    </table>
+</body>
+
+</html>
