@@ -134,7 +134,7 @@
             acbFields.hidden = isBinance;
             binanceFields.hidden = !isBinance;
             acbFields.querySelectorAll('input').forEach(input => input.required = !isBinance);
-            binanceFields.querySelectorAll('input').forEach(input => input.required = isBinance);
+            binanceFields.querySelectorAll('input[name="api_key"], input[name="api_secret"]').forEach(input => input.required = isBinance);
         }
         provider.addEventListener('change', toggleProviderFields);
         toggleProviderFields();

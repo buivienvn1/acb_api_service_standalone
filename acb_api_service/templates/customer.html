@@ -122,7 +122,9 @@
             key mới (để trống giữ nguyên)<input name="api_key" autocomplete="off"></label><label>API secret mới (để
             trống giữ nguyên)<input type="password" name="api_secret" autocomplete="new-password"></label><label>Proxy
             URL riêng (để trống giữ nguyên)<input name="proxy_url"
-                placeholder="http://user:pass@host:port hoặc socks5://host:port" autocomplete="off"></label>{% else
+                placeholder="http://user:pass@host:port hoặc socks5://host:port"
+                autocomplete="off"></label><label><input type="checkbox" name="clear_proxy" value="1"> Xóa proxy riêng
+            (dùng proxy global hoặc kết nối trực tiếp)</label>{% else
         %}<label>Username mới (để trống giữ nguyên)<input name="username" autocomplete="off"></label><label>Password mới
             (để trống giữ nguyên)<input type="password" name="password" autocomplete="new-password"></label>{% endif
         %}<label>Hết hạn<input name="expires_at" value="{{ customer.expires_at or '' }}"></label><label><input

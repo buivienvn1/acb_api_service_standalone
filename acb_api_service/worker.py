@@ -71,13 +71,14 @@ class Poller:
 
     def _global_binance_proxy(self) -> str:
         encrypted = self.database.get_setting("binance_proxy")
-        if not encrypted:
-            return self.settings.binance_proxy
-        try:
-            return self.crypto.decrypt_string(encrypted).strip()
-        except Exception:
-            LOGGER.warning("invalid encrypted global Binance proxy setting")
-            return self.settings.binance_proxy
+        if encrypted:
+            try:
+                value = self.crypto.decrypt_string(encrypted).strip()
+                return "" if value == "DISABLED" else value
+            except Exception:
+                LOGGER.warning("invalid encrypted global Binance proxy setting")
+                return ""
+        return self.settings.binance_proxy
 
     def sync_customer(self, customer_id: int, *, force: bool = False) -> int:
         lock = self._lock_for(customer_id)

@@ -133,12 +133,14 @@ class Crypto:
         return hashlib.sha256(raw_key.encode()).hexdigest()
 
     @staticmethod
-    def new_api_key() -> str:
-        return "acb_live_" + secrets.token_urlsafe(32)
+    def new_api_key(provider: str = "acb") -> str:
+        prefix = "binance_live_" if provider.lower() == "binance" else "acb_live_"
+        return prefix + secrets.token_urlsafe(32)
 
     @staticmethod
-    def new_feed_token() -> str:
-        return "acb_feed_" + secrets.token_urlsafe(48)
+    def new_feed_token(provider: str = "acb") -> str:
+        prefix = "binance_feed_" if provider.lower() == "binance" else "acb_feed_"
+        return prefix + secrets.token_urlsafe(48)
 
     def sign(self, value: str) -> str:
         return hmac.new(self.session_secret, value.encode(), hashlib.sha256).hexdigest()

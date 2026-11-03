@@ -84,15 +84,19 @@
             bại' }}</strong><br>{{ result.message }}{% if result.latency_ms is defined %}<br>Độ trễ: {{
         result.latency_ms }} ms{% endif %}</div>{% endif %}
     <div class="card">
-        <p><strong>Trạng thái:</strong> {{ 'Đã cấu hình proxy' if proxy_configured else 'Chưa cấu hình, đang kết nối
-            trực tiếp' }}</p>
+        <p><strong>Trạng thái:</strong> {% if proxy_configured %}Đã cấu hình proxy{% elif proxy_disabled %}Đã tắt proxy,
+            đang kết nối trực tiếp{% else %}Chưa cấu hình, đang kết nối trực tiếp{% endif %}</p>
         <form method="post" action="/admin/settings/proxy">
             <input type="hidden" name="csrf_token" value="{{ csrf }}">
             <label>Proxy URL mới (để trống để xóa cấu hình)
                 <input name="proxy_url" placeholder="http://user:pass@host:port hoặc socks5://host:port"
                     autocomplete="off">
             </label>
-            <button>Lưu proxy global</button>
+            <div class="actions">
+                <button type="submit">Lưu proxy global</button>
+                <button type="submit" name="disable_proxy" value="1" style="background:#991b1b">Tắt proxy
+                    global</button>
+            </div>
         </form>
     </div>
     <div class="actions">
