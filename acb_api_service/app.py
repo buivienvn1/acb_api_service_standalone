@@ -108,11 +108,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         customer = database.one("SELECT * FROM customers WHERE id=?", (customer_id,))
         if not customer:
             raise HTTPException(404)
-        transactions = [dict(row) for row in database.all(
+        transactions = []
+        for row in database.all(
             "SELECT * FROM transactions WHERE customer_id=? "
             "ORDER BY COALESCE(transacted_at,created_at) DESC,id DESC LIMIT 100",
             (customer_id,),
-        )]
+        ):
+            transaction = dict(row)
+            try:
+                metadata = json.loads(transaction.get("extra_meta") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            if isinstance(metadata, dict):
+                transaction.update({
+                    "network": metadata.get("network", ""),
+                    "address": metadata.get("address", ""),
+                })
+            else:
+                transaction.update({"network": "", "address": ""})
+            transactions.append(transaction)
         audits = [dict(row) for row in database.all("SELECT * FROM audit_logs WHERE customer_id=? ORDER BY id DESC LIMIT 50", (customer_id,))]
         active_key = database.one("SELECT key_prefix,created_at,last_used_at FROM api_keys WHERE customer_id=? AND revoked_at IS NULL", (customer_id,))
         active_feed = database.one("SELECT token_prefix,created_at,last_used_at FROM feed_links WHERE customer_id=? AND revoked_at IS NULL", (customer_id,))
@@ -168,17 +182,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/admin/customers")
     def create_customer(
-        request: Request, name: str = Form(...), account_number: str = Form(...), username: str = Form(...),
-        password: str = Form(...), expires_at: str = Form(""), csrf_token: str = Form(...),
+        request: Request, name: str = Form(...), account_number: str = Form(...),
+        username: str = Form(""), password: str = Form(""), provider: str = Form("acb"),
+        channel_type: str = Form(""), api_key: str = Form(""), api_secret: str = Form(""),
+        expires_at: str = Form(""), csrf_token: str = Form(...),
         session: dict[str, Any] = Depends(admin_session),
     ):
         csrf(request, session, csrf_token)
+        provider = provider.strip().lower()
+        channel_type = channel_type.strip().lower() or None
+        if provider not in {"acb", "binance"}:
+            raise HTTPException(400, "Provider không hợp lệ")
+        if provider == "binance":
+            if not api_key.strip() or not api_secret.strip():
+                raise HTTPException(400, "Binance API key/secret là bắt buộc")
+            if channel_type not in {None, "all", "pay", "bsc", "trx"}:
+                raise HTTPException(400, "Kênh Binance không hợp lệ")
+            credentials = {"api_key": api_key.strip(), "api_secret": api_secret.strip()}
+        else:
+            if not username.strip() or not password:
+                raise HTTPException(400, "ACB username/password là bắt buộc")
+            channel_type = None
+            credentials = {"username": username.strip(), "password": password}
         now = utcnow()
         customer_id = database.execute(
-            "INSERT INTO customers(name,account_number,credential_ciphertext,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-            (name.strip()[:200], account_number.strip()[:64], crypto.encrypt_json({"username": username, "password": password}), expires_at.strip() or None, now, now),
+            "INSERT INTO customers(name,account_number,credential_ciphertext,expires_at,created_at,updated_at,provider,channel_type) VALUES(?,?,?,?,?,?,?,?)",
+            (name.strip()[:200], account_number.strip()[:64], crypto.encrypt_json(credentials), expires_at.strip() or None, now, now, provider, channel_type),
         )
-        database.audit("customer.created", customer_id, remote_ip(request), {"name": name[:200]})
+        database.audit("customer.created", customer_id, remote_ip(request), {"name": name[:200], "provider": provider})
         return RedirectResponse(f"/admin/customers/{customer_id}", 303)
 
     @app.get("/admin/customers/{customer_id}", response_class=HTMLResponse)
@@ -186,14 +217,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return render_customer(request, customer_id, session)
 
     @app.post("/admin/customers/{customer_id}/update")
-    def update_customer(request: Request, customer_id: int, name: str = Form(...), account_number: str = Form(...), username: str = Form(""), password: str = Form(""), expires_at: str = Form(""), locked: str | None = Form(None), csrf_token: str = Form(...), session: dict[str, Any] = Depends(admin_session)):
+    def update_customer(request: Request, customer_id: int, name: str = Form(...), account_number: str = Form(...), username: str = Form(""), password: str = Form(""), api_key: str = Form(""), api_secret: str = Form(""), expires_at: str = Form(""), locked: str | None = Form(None), csrf_token: str = Form(...), session: dict[str, Any] = Depends(admin_session)):
         csrf(request, session, csrf_token)
         existing = database.one("SELECT * FROM customers WHERE id=?", (customer_id,))
         if not existing: raise HTTPException(404)
         cipher = existing["credential_ciphertext"]
-        if username or password:
+        if api_key or api_secret or username or password:
             old = crypto.decrypt_json(cipher)
-            cipher = crypto.encrypt_json({"username": username or old["username"], "password": password or old["password"]})
+            if existing["provider"] == "binance":
+                cipher = crypto.encrypt_json({"api_key": api_key or old.get("api_key", ""), "api_secret": api_secret or old.get("api_secret", "")})
+            else:
+                cipher = crypto.encrypt_json({"username": username or old.get("username", ""), "password": password or old.get("password", "")})
         database.execute("UPDATE customers SET name=?,account_number=?,credential_ciphertext=?,expires_at=?,locked=?,updated_at=? WHERE id=?", (name.strip()[:200], account_number.strip()[:64], cipher, expires_at.strip() or None, 1 if locked else 0, utcnow(), customer_id))
         database.audit("customer.updated", customer_id, remote_ip(request), {"locked": bool(locked)})
         return RedirectResponse(f"/admin/customers/{customer_id}", 303)
@@ -260,44 +294,78 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally: database.audit("customer.connection_test", customer_id, remote_ip(request))
         return RedirectResponse(f"/admin/customers/{customer_id}", 303)
 
-    @app.get("/api/v1/feed")
-    def api_feed(cursor: int | None = Query(None, ge=1), limit: int = Query(100, ge=1, le=200), customer: dict[str, Any] = Depends(authenticate_feed)):
-        if not customer["last_sync_ok_at"]:
-            raise HTTPException(503, "Dữ liệu chưa từng đồng bộ thành công")
-        stale = time.time() - datetime.fromisoformat(customer["last_sync_ok_at"]).timestamp() > settings.stale_after_seconds
+    def _feed_transactions(customer: dict[str, Any], cursor: int | None, limit: int, kind: str | None = None) -> tuple[list[dict[str, Any]], int | None]:
         clauses, params = ["customer_id=?"], [customer["id"]]
+        if kind:
+            transaction_type = {"pay": "BINANCE_PAY", "bsc": "BINANCE_BSC_DEPOSIT", "trx": "BINANCE_TRX_DEPOSIT"}.get(kind)
+            if not transaction_type:
+                raise HTTPException(404, "Feed not found")
+            clauses.append("transaction_type=?")
+            params.append(transaction_type)
         if cursor:
-            cursor_row = database.one(
-                "SELECT id,COALESCE(transacted_at,created_at) sort_at FROM transactions WHERE id=? AND customer_id=?",
-                (cursor, customer["id"]),
-            )
+            cursor_row = database.one("SELECT id,COALESCE(transacted_at,created_at) sort_at FROM transactions WHERE id=? AND customer_id=?", (cursor, customer["id"]))
             if not cursor_row:
                 raise HTTPException(400, "Cursor không hợp lệ")
             clauses.append("(COALESCE(transacted_at,created_at)<? OR (COALESCE(transacted_at,created_at)=? AND id<?))")
             params.extend((cursor_row["sort_at"], cursor_row["sort_at"], cursor_row["id"]))
         params.append(limit + 1)
-        rows = database.all(
-            f"SELECT id,external_id,amount,description,transaction_type,transacted_at,raw_json "
-            f"FROM transactions WHERE {' AND '.join(clauses)} "
-            "ORDER BY COALESCE(transacted_at,created_at) DESC,id DESC LIMIT ?",
-            tuple(params),
-        )
+        rows = database.all(f"SELECT id,external_id,amount,description,transaction_type,transacted_at,raw_json,currency,extra_meta FROM transactions WHERE {' AND '.join(clauses)} ORDER BY COALESCE(transacted_at,created_at) DESC,id DESC LIMIT ?", tuple(params))
         more, rows = len(rows) > limit, rows[:limit]
         transactions = []
         for row in rows:
-            raw = json.loads(row["raw_json"] or "{}")
-            tx_type = row["transaction_type"] or "UNKNOWN"
-            item = {"transactionNumber": row["external_id"], "transactionID": row["external_id"],
-                    "amount": row["amount"], "description": row["description"],
-                    "transactionDate": raw.get("transactionDate") or row["transacted_at"] or "", "type": tx_type}
-            for field in ("timestamp", "activeDatetime", "postingDate", "effectiveDate"):
-                if raw.get(field) is not None:
-                    item[field] = raw[field]
+            try:
+                raw = json.loads(row["raw_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                raw = {}
+            if not isinstance(raw, dict):
+                raw = {}
+            item = {"transactionNumber": row["external_id"], "transactionID": row["external_id"], "amount": row["amount"], "description": row["description"], "transactionDate": raw.get("transactionDate") or row["transacted_at"] or "", "type": row["transaction_type"], "currency": row["currency"]}
+            try:
+                extra_meta = json.loads(row["extra_meta"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                extra_meta = {}
+            if isinstance(extra_meta, dict):
+                item.update({key: value for key, value in extra_meta.items() if key not in item})
             transactions.append(item)
+        return transactions, rows[-1]["id"] if more else None
+
+    @app.get("/api/v1/feed")
+    def api_feed(cursor: int | None = Query(None, ge=1), limit: int = Query(100, ge=1, le=200), customer: dict[str, Any] = Depends(authenticate_feed)):
+        if not customer["last_sync_ok_at"]:
+            raise HTTPException(503, "Dữ liệu chưa từng đồng bộ thành công")
+        stale = time.time() - datetime.fromisoformat(customer["last_sync_ok_at"]).timestamp() > settings.stale_after_seconds
+        transactions, next_cursor = _feed_transactions(customer, cursor, limit)
         return {"status": "success", "transactions": transactions,
-                "next_cursor": rows[-1]["id"] if more else None, "stale": stale,
+                "next_cursor": next_cursor, "stale": stale,
                 "incomplete": bool(customer["last_sync_error"]), "last_sync_at": customer["last_sync_at"],
                 "last_sync_ok_at": customer["last_sync_ok_at"]}
+
+    def _authenticate_legacy_binance(tenant_id: str, token: str) -> dict[str, Any]:
+        customer = database.one("SELECT c.*, f.id AS feed_id FROM customers c JOIN feed_links f ON f.customer_id=c.id WHERE c.account_number=? AND f.token_hash=? AND f.revoked_at IS NULL", (tenant_id, crypto.hash_api_key(token)))
+        if not customer or customer["provider"] != "binance":
+            raise HTTPException(404, "Feed not found")
+        now = utcnow()
+        if customer["locked"]:
+            raise HTTPException(423, "Tài khoản dịch vụ đang bị khóa")
+        if customer["expires_at"] and customer["expires_at"] <= now:
+            raise HTTPException(403, "Gói dịch vụ đã hết hạn")
+        if not limiter.allow(f"customer:{customer['id']}", settings.api_rate_limit_per_minute):
+            raise HTTPException(429, "Vượt giới hạn request", headers={"Retry-After": "60"})
+        database.execute("UPDATE feed_links SET last_used_at=? WHERE id=?", (now, customer["feed_id"]))
+        return dict(customer)
+
+    @app.get("/api/v1/{tenant_id}/{kind}/feed")
+    def legacy_binance_feed(tenant_id: str, kind: str, token: str = Query(..., min_length=32), limit: int = Query(100, ge=1, le=200)):
+        if kind not in {"pay", "bsc", "trx"}:
+            raise HTTPException(404, "Feed not found")
+        customer = _authenticate_legacy_binance(tenant_id, token)
+        transactions, next_cursor = _feed_transactions(customer, None, limit, kind)
+        return {"status": "success", "tenant_id": tenant_id, "feed": kind, "transactions": transactions, "updated_at": customer["last_sync_at"], "next_cursor": next_cursor, "stale": not customer["last_sync_ok_at"], "last_error": customer["last_sync_error"]}
+
+    @app.get("/api/v1/{tenant_id}/status")
+    def legacy_binance_status(tenant_id: str, token: str = Query(..., min_length=32)):
+        customer = _authenticate_legacy_binance(tenant_id, token)
+        return {"status": "success", "tenant_id": tenant_id, "last_sync_at": customer["last_sync_at"], "last_sync_ok_at": customer["last_sync_ok_at"], "stale": not customer["last_sync_ok_at"], "last_error": customer["last_sync_error"]}
 
     @app.get("/api/v1/status")
     def api_status(customer: dict[str, Any] = Depends(authenticate_api)):

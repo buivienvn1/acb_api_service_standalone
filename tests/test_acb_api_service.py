@@ -309,6 +309,30 @@ class ACBAPIServiceTest(unittest.TestCase):
         self.assertNotIn(new_raw, str(self.db.all("SELECT details FROM audit_logs")))
         self.assertEqual(rotated.headers["cache-control"], "no-store")
 
+    def test_binance_legacy_feed_authentication_and_channel_filter(self):
+        now = utcnow()
+        customer_id = self.db.execute(
+            "INSERT INTO customers(name,account_number,credential_ciphertext,created_at,updated_at,provider,channel_type,last_sync_at,last_sync_ok_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            ("Binance tenant", "binance-001", self.crypto.encrypt_json({"api_key": "key", "api_secret": "secret"}), now, now, "binance", "all", now, now),
+        )
+        feed = self._feed(customer_id)
+        self.db.execute(
+            "INSERT INTO transactions(customer_id,external_id,amount,description,transaction_type,transacted_at,raw_json,created_at,currency,extra_meta) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (customer_id, "PAY-1", 12.5, "Pay", "BINANCE_PAY", now, "{}", now, "USDT", "{}"),
+        )
+        self.db.execute(
+            "INSERT INTO transactions(customer_id,external_id,amount,description,transaction_type,transacted_at,raw_json,created_at,currency,extra_meta) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (customer_id, "BSC-1", 20, "Deposit", "BINANCE_BSC_DEPOSIT", now, "{}", now, "USDT", '{"network":"BSC"}'),
+        )
+        client = self._app_client()
+        pay = client.get(f"/api/v1/binance-001/pay/feed?token={feed}")
+        self.assertEqual(pay.status_code, 200)
+        self.assertEqual([row["transactionID"] for row in pay.json()["transactions"]], ["PAY-1"])
+        self.assertEqual(client.get(f"/api/v1/binance-001/trx/feed?token={feed}").json()["transactions"], [])
+        self.assertEqual(client.get(f"/api/v1/binance-001/status?token={feed}").status_code, 200)
+        self.assertEqual(client.get(f"/api/v1/binance-001/pay/feed?token={'x' * 32}").status_code, 404)
+        self.assertIsNotNone(self.db.one("SELECT last_used_at FROM feed_links WHERE customer_id=?", (customer_id,))["last_used_at"])
+
     def test_feed_expiry_and_cross_tenant_data_isolation(self):
         Poller(self.settings, self.db, self.crypto, FakeAdapter).sync_customer(self.customer_ids[0], force=True)
         expired_id = self._customer("Expired feed", "77778888", (datetime.now(UTC)-timedelta(days=1)).isoformat())

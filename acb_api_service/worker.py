@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from acb_api_service.acb_adapter import ACBAdapter
+from acb_api_service.binance_adapter import BinanceAdapter
 from acb_api_service.core import Crypto, Database, Settings, utcnow
 
 
@@ -20,15 +21,15 @@ LOGGER = logging.getLogger("acb_api.worker")
 UTC = timezone.utc
 
 
-def normalize_transaction(item: dict[str, Any]) -> tuple[str, int, str, str, str | None, str]:
-    external_id = str(item.get("transactionNumber") or item.get("transactionID") or "").strip()
+def normalize_transaction(item: dict[str, Any]) -> tuple[str, float, str, str, str | None, str, str, str]:
+    external_id = str(item.get("transactionNumber") or item.get("transactionID") or item.get("txId") or "").strip()
     timestamp = item.get("activeDatetime") or item.get("postingDate") or item.get("effectiveDate") or item.get("timestamp")
     amount_raw = item.get("amount") or 0
     try:
-        amount = int(float(amount_raw))
+        amount = float(amount_raw)
     except (TypeError, ValueError):
-        amount = 0
-    description = str(item.get("description") or "")[:2000]
+        amount = 0.0
+    description = str(item.get("description") or item.get("note") or "")[:2000]
     tx_type = str(item.get("type") or "UNKNOWN").upper()[:32]
     transacted_at = None
     if timestamp is not None:
@@ -43,7 +44,9 @@ def normalize_transaction(item: dict[str, Any]) -> tuple[str, int, str, str, str
         stable = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         external_id = "derived_" + hashlib.sha256(stable.encode()).hexdigest()
     raw_json = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-    return external_id, amount, description, tx_type, transacted_at, raw_json
+    currency = str(item.get("currency") or "VND").upper()[:16]
+    metadata = {key: item[key] for key in ("network", "address", "orderId", "status", "payerInfo") if key in item}
+    return external_id, amount, description, tx_type, transacted_at, raw_json, currency, json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
 
 
 class Poller:
@@ -78,20 +81,36 @@ class Poller:
             if customer["expires_at"] and customer["expires_at"] <= now:
                 return 0
             credentials = self.crypto.decrypt_json(customer["credential_ciphertext"])
-            adapter = self.adapter_factory(
-                credentials.get("username", ""), credentials.get("password", ""),
-                customer["account_number"], timeout=self.settings.acb_timeout_seconds,
-            )
-            try:
-                rows = adapter.fetch_transactions(rows=300, days_back=7 if customer["last_sync_ok_at"] is None else 3)
-            finally:
-                adapter.close()
+            provider = str(customer["provider"] or "acb").lower()
+            if provider == "binance":
+                adapter = BinanceAdapter(
+                    credentials.get("api_key", ""), credentials.get("api_secret", ""),
+                    timeout=self.settings.binance_timeout_seconds,
+                    base_url=self.settings.binance_base_url,
+                )
+                try:
+                    channel = str(customer["channel_type"] or "all").lower()
+                    kinds = [channel] if channel in {"pay", "bsc", "trx"} else ["pay", "bsc", "trx"]
+                    rows = []
+                    for kind in kinds:
+                        rows.extend(adapter.fetch_transactions(kind, history_limit=self.settings.binance_history_limit, history_days=self.settings.binance_history_days))
+                finally:
+                    adapter.close()
+            else:
+                adapter = self.adapter_factory(
+                    credentials.get("username", ""), credentials.get("password", ""),
+                    customer["account_number"], timeout=self.settings.acb_timeout_seconds,
+                )
+                try:
+                    rows = adapter.fetch_transactions(rows=300, days_back=7 if customer["last_sync_ok_at"] is None else 3)
+                finally:
+                    adapter.close()
             inserted = 0
             with self.database.transaction() as connection:
                 for item in rows:
                     values = normalize_transaction(item)
                     cursor = connection.execute(
-                        "INSERT OR IGNORE INTO transactions(customer_id,external_id,amount,description,transaction_type,transacted_at,raw_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                        "INSERT OR IGNORE INTO transactions(customer_id,external_id,amount,description,transaction_type,transacted_at,raw_json,created_at,currency,extra_meta) VALUES(?,?,?,?,?,?,?,?,?,?)",
                         (customer_id, *values, now),
                     )
                     inserted += cursor.rowcount

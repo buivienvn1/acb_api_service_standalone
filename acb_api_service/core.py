@@ -60,6 +60,10 @@ class Settings:
     api_rate_limit_per_minute: int
     session_ttl_seconds: int
     acb_timeout_seconds: int
+    binance_base_url: str = "https://api.binance.com"
+    binance_timeout_seconds: int = 20
+    binance_history_limit: int = 100
+    binance_history_days: int = 7
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -86,6 +90,10 @@ class Settings:
             api_rate_limit_per_minute=max(1, int(os.getenv("ACB_API_RATE_LIMIT_PER_MINUTE", "60"))),
             session_ttl_seconds=max(300, int(os.getenv("ACB_API_SESSION_TTL_SECONDS", "28800"))),
             acb_timeout_seconds=max(5, int(os.getenv("ACB_API_ACB_TIMEOUT_SECONDS", "20"))),
+            binance_base_url=os.getenv("BINANCE_BASE_URL", "https://api.binance.com").rstrip("/"),
+            binance_timeout_seconds=max(5, int(os.getenv("BINANCE_REQUEST_TIMEOUT_SECONDS", "20"))),
+            binance_history_limit=max(1, min(1000, int(os.getenv("BINANCE_HISTORY_LIMIT", "100")))),
+            binance_history_days=max(1, min(30, int(os.getenv("BINANCE_HISTORY_DAYS", "7")))),
         )
 
 
@@ -175,6 +183,7 @@ CREATE TABLE IF NOT EXISTS customers (
  credential_ciphertext TEXT NOT NULL, expires_at TEXT, locked INTEGER NOT NULL DEFAULT 0,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_sync_at TEXT, last_sync_ok_at TEXT,
  last_sync_error TEXT, next_sync_at TEXT, failure_count INTEGER NOT NULL DEFAULT 0,
+ provider TEXT NOT NULL DEFAULT 'acb', channel_type TEXT DEFAULT NULL,
  UNIQUE(account_number)
 );
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -191,9 +200,10 @@ CREATE TABLE IF NOT EXISTS feed_links (
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_feed_per_customer ON feed_links(customer_id) WHERE revoked_at IS NULL;
 CREATE TABLE IF NOT EXISTS transactions (
  id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
- external_id TEXT NOT NULL, amount INTEGER NOT NULL, description TEXT NOT NULL DEFAULT '',
+ external_id TEXT NOT NULL, amount REAL NOT NULL, description TEXT NOT NULL DEFAULT '',
  transaction_type TEXT NOT NULL DEFAULT 'UNKNOWN', transacted_at TEXT, raw_json TEXT NOT NULL,
- created_at TEXT NOT NULL, UNIQUE(customer_id, external_id)
+ created_at TEXT NOT NULL, currency TEXT NOT NULL DEFAULT 'VND', extra_meta TEXT NOT NULL DEFAULT '{}',
+ UNIQUE(customer_id, external_id)
 );
 CREATE INDEX IF NOT EXISTS transactions_customer_cursor ON transactions(customer_id, id DESC);
 CREATE TABLE IF NOT EXISTS admin_sessions (
@@ -241,8 +251,27 @@ class Database:
             connection = self.connect()
             try:
                 connection.executescript(SCHEMA)
+                self._additive_migrations(connection)
             finally:
                 connection.close()
+
+    @staticmethod
+    def _additive_migrations(connection: sqlite3.Connection) -> None:
+        migrations = {
+            "customers": {
+                "provider": "TEXT NOT NULL DEFAULT 'acb'",
+                "channel_type": "TEXT DEFAULT NULL",
+            },
+            "transactions": {
+                "currency": "TEXT NOT NULL DEFAULT 'VND'",
+                "extra_meta": "TEXT NOT NULL DEFAULT '{}'",
+            },
+        }
+        for table, columns in migrations.items():
+            existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+            for name, definition in columns.items():
+                if name not in existing:
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     def one(self, query: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
         connection = self.connect()

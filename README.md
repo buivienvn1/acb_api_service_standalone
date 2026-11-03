@@ -19,6 +19,25 @@ chmod 700 data data/acb_api
 
 Đưa ba giá trị bootstrap vào `.env`: `ACB_API_ENCRYPTION_KEY`, `ACB_API_SESSION_SECRET`, `ACB_API_ADMIN_PASSWORD_HASH`. Không commit hoặc gửi các giá trị này qua log/chat. Encryption key phải được backup riêng.
 
+## Binance (tùy chọn)
+
+Có thể tạo tenant Binance trong Admin UI mà không cần chạy service riêng. Chọn provider `Binance`, nhập API key/secret chỉ có quyền đọc và chọn kênh `Binance Pay`, `BSC / USDT`, `TRX` hoặc tất cả. API key/secret được Fernet mã hóa trong SQLite; không xuất hiện trong feed URL.
+
+Các biến `BINANCE_*` trong `.env.example` điều khiển endpoint, timeout và khoảng lịch sử polling. Feed chuẩn vẫn cấp cho khách hàng dạng:
+
+```text
+https://your-domain.example/api/v1/feed?token=<feed_token>
+```
+
+Để tương thích bot Binance cũ, service cũng hỗ trợ:
+
+```text
+https://your-domain.example/api/v1/<tenant_id>/<kind>/feed?token=<feed_token>
+https://your-domain.example/api/v1/<tenant_id>/status?token=<feed_token>
+```
+
+Trong đó `kind` là `pay`, `bsc` hoặc `trx`. Không đặt API secret vào URL, query log hoặc mã nguồn.
+
 ## Chạy thử
 
 ```bash

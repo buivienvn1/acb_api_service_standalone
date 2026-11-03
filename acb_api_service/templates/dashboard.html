@@ -81,7 +81,9 @@
             <tr>
                 <th>ID</th>
                 <th>Tên</th>
-                <th>Tài khoản</th>
+                <th>Provider</th>
+                <th>Tài khoản / tenant</th>
+                <th>Kênh</th>
                 <th>Hết hạn</th>
                 <th>Trạng thái</th>
                 <th>Đồng bộ</th>
@@ -90,23 +92,50 @@
         <tbody>{% for c in customers %}<tr>
                 <td><a href="/admin/customers/{{ c.id }}">{{ c.id }}</a></td>
                 <td>{{ c.name }}</td>
+                <td>{{ c.provider|upper }}</td>
                 <td>••••{{ c.account_number[-4:] }}</td>
+                <td>{{ c.channel_type or 'ACB' if c.provider == 'acb' else 'ALL' }}</td>
                 <td>{{ c.expires_at or 'Không giới hạn' }}</td>
                 <td>{{ 'Khóa' if c.locked else 'Mở' }}</td>
                 <td>{{ c.last_sync_ok_at or 'Chưa có' }}</td>
             </tr>{% else %}<tr>
-                <td colspan="6" class="muted">Chưa có khách hàng.</td>
+                <td colspan="8" class="muted">Chưa có khách hàng.</td>
             </tr>{% endfor %}</tbody>
     </table>
     <h2>Thêm khách hàng</h2>
-    <form class="card" method="post" action="/admin/customers"><input type="hidden" name="csrf_token"
-            value="{{ csrf }}"><label>Tên<input name="name" maxlength="200" required></label><label>Số tài khoản
-            ACB<input name="account_number" maxlength="64" required></label><label>ACB username<input name="username"
-                autocomplete="off" required></label><label>ACB password<input type="password" name="password"
-                autocomplete="new-password" required></label><label>Hết hạn (ISO UTC)<input name="expires_at"
+    <form class="card" method="post" action="/admin/customers" id="create-customer-form"><input type="hidden"
+            name="csrf_token" value="{{ csrf }}"><label>Provider<select name="provider" id="provider-select">
+                <option value="acb">ACB</option>
+                <option value="binance">Binance</option>
+            </select></label><label>Tên<input name="name" maxlength="200" required></label><label>Số tài khoản /
+            tenant<input name="account_number" maxlength="64" required></label>
+        <div id="acb-fields"><label>ACB username<input name="username" autocomplete="off"></label><label>ACB
+                password<input type="password" name="password" autocomplete="new-password"></label></div>
+        <div id="binance-fields" hidden><label>Binance API key<input name="api_key"
+                    autocomplete="off"></label><label>Binance API secret<input type="password" name="api_secret"
+                    autocomplete="new-password"></label><label>Kênh Binance<select name="channel_type">
+                    <option value="all">Tất cả</option>
+                    <option value="pay">Binance Pay</option>
+                    <option value="bsc">BSC / USDT</option>
+                    <option value="trx">TRX</option>
+                </select></label></div><label>Hết hạn (ISO UTC)<input name="expires_at"
                 placeholder="2027-01-01T00:00:00+00:00"></label>
         <div><button>Tạo</button></div>
     </form>
+    <script>
+        const provider = document.getElementById('provider-select');
+        const acbFields = document.getElementById('acb-fields');
+        const binanceFields = document.getElementById('binance-fields');
+        function toggleProviderFields() {
+            const isBinance = provider.value === 'binance';
+            acbFields.hidden = isBinance;
+            binanceFields.hidden = !isBinance;
+            acbFields.querySelectorAll('input').forEach(input => input.required = !isBinance);
+            binanceFields.querySelectorAll('input').forEach(input => input.required = isBinance);
+        }
+        provider.addEventListener('change', toggleProviderFields);
+        toggleProviderFields();
+    </script>
 </body>
 
 </html>
