@@ -21,13 +21,17 @@ class BinanceAdapter:
         *,
         timeout: int = 20,
         base_url: str = "https://api.binance.com",
+        proxy_url: str = "",
     ) -> None:
         self.api_key = api_key
         self.api_secret = api_secret
         self.timeout = max(3, timeout)
         self.base_url = base_url.rstrip("/")
+        self.proxy_url = proxy_url.strip()
         self.session = requests.Session()
         self.session.headers.update({"X-MBX-APIKEY": self.api_key})
+        if self.proxy_url:
+            self.session.proxies.update({"http": self.proxy_url, "https": self.proxy_url})
         self.lock = threading.Lock()
         self.time_drift_ms = 0
         self.last_success_at = 0.0
@@ -73,6 +77,23 @@ class BinanceAdapter:
         if samples:
             samples.sort()
             self.time_drift_ms = samples[len(samples) // 2] - 1000
+
+    def test_connection(self) -> dict[str, Any]:
+        """Run a small public-time and signed-account probe with safe diagnostics."""
+        started = time.perf_counter()
+        self.sync_time()
+        public_ms = round((time.perf_counter() - started) * 1000)
+        signed_started = time.perf_counter()
+        # This read-only endpoint validates key, secret, timestamp and API permissions.
+        self._request("/sapi/v1/capital/deposit/hisrec", {"coin": "USDT", "limit": 1})
+        return {
+            "ok": True,
+            "proxy": bool(self.proxy_url),
+            "latency_ms": public_ms,
+            "signed_latency_ms": round((time.perf_counter() - signed_started) * 1000),
+            "time_drift_ms": self.time_drift_ms,
+            "message": "Kết nối Binance và API key hợp lệ",
+        }
 
     def fetch_transactions(self, kind: str, *, history_limit: int = 100, history_days: int = 7) -> list[dict[str, Any]]:
         """Fetch and normalize Binance Pay, BSC USDT, or TRX deposit rows."""

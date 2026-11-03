@@ -69,6 +69,16 @@ class Poller:
         with self._locks_guard:
             return self._customer_locks.setdefault(customer_id, threading.Lock())
 
+    def _global_binance_proxy(self) -> str:
+        encrypted = self.database.get_setting("binance_proxy")
+        if not encrypted:
+            return self.settings.binance_proxy
+        try:
+            return self.crypto.decrypt_string(encrypted).strip()
+        except Exception:
+            LOGGER.warning("invalid encrypted global Binance proxy setting")
+            return self.settings.binance_proxy
+
     def sync_customer(self, customer_id: int, *, force: bool = False) -> int:
         lock = self._lock_for(customer_id)
         if not lock.acquire(blocking=False):
@@ -87,6 +97,7 @@ class Poller:
                     credentials.get("api_key", ""), credentials.get("api_secret", ""),
                     timeout=self.settings.binance_timeout_seconds,
                     base_url=self.settings.binance_base_url,
+                    proxy_url=credentials.get("proxy_url", "") or self._global_binance_proxy(),
                 )
                 try:
                     channel = str(customer["channel_type"] or "all").lower()
@@ -129,7 +140,7 @@ class Poller:
                 "UPDATE customers SET last_sync_at=?,last_sync_error=?,failure_count=?,next_sync_at=?,updated_at=? WHERE id=?",
                 (utcnow(), type(exc).__name__, failures, next_sync.isoformat(timespec="seconds"), utcnow(), customer_id),
             )
-            LOGGER.warning("sync failed customer_id=%s error=%s", customer_id, type(exc).__name__)
+            LOGGER.warning("sync failed customer_id=%s error=%s detail=%s", customer_id, type(exc).__name__, str(exc)[:500])
             if force:
                 raise
             return 0

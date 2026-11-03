@@ -13,6 +13,14 @@ class BinanceAdapterTests(unittest.TestCase):
     def setUp(self) -> None:
         self.adapter = BinanceAdapter("key", "secret")
 
+    def test_proxy_is_applied_to_http_and_https(self) -> None:
+        adapter = BinanceAdapter("key", "secret", proxy_url="socks5://127.0.0.1:1080")
+        try:
+            self.assertEqual(adapter.session.proxies["http"], "socks5://127.0.0.1:1080")
+            self.assertEqual(adapter.session.proxies["https"], "socks5://127.0.0.1:1080")
+        finally:
+            adapter.close()
+
     def tearDown(self) -> None:
         self.adapter.close()
 

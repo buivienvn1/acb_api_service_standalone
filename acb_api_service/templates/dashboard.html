@@ -76,6 +76,7 @@
         <form method="post" action="/admin/logout"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button
                 class="danger">Đăng xuất</button></form>
     </header>
+    <p><a href="/admin/settings/proxy">⚙ Cấu hình Proxy Binance global</a></p>
     <table>
         <thead>
             <tr>
@@ -113,7 +114,9 @@
                 password<input type="password" name="password" autocomplete="new-password"></label></div>
         <div id="binance-fields" hidden><label>Binance API key<input name="api_key"
                     autocomplete="off"></label><label>Binance API secret<input type="password" name="api_secret"
-                    autocomplete="new-password"></label><label>Kênh Binance<select name="channel_type">
+                    autocomplete="new-password"></label><label>Proxy URL (tuỳ chọn)<input name="proxy_url"
+                    placeholder="http://user:pass@host:port hoặc socks5://host:port"
+                    autocomplete="off"></label><label>Kênh Binance<select name="channel_type">
                     <option value="all">Tất cả</option>
                     <option value="pay">Binance Pay</option>
                     <option value="bsc">BSC / USDT</option>

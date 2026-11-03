@@ -12,6 +12,7 @@ from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Reques
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from acb_api_service.binance_adapter import BinanceAdapter
 from acb_api_service.core import Crypto, Database, Settings, SlidingWindowLimiter, utcnow, verify_password
 from acb_api_service.worker import Poller
 
@@ -131,10 +132,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         active_key = database.one("SELECT key_prefix,created_at,last_used_at FROM api_keys WHERE customer_id=? AND revoked_at IS NULL", (customer_id,))
         active_feed = database.one("SELECT token_prefix,created_at,last_used_at FROM feed_links WHERE customer_id=? AND revoked_at IS NULL", (customer_id,))
         stale = not customer["last_sync_ok_at"] or (datetime.fromisoformat(customer["last_sync_ok_at"]) < datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=settings.stale_after_seconds))
+        credentials = crypto.decrypt_json(customer["credential_ciphertext"])
+        stored_global_proxy = database.get_setting("binance_proxy")
+        try:
+            stored_global_proxy = crypto.decrypt_string(stored_global_proxy).strip() if stored_global_proxy else ""
+        except Exception:
+            stored_global_proxy = ""
+        proxy_configured = bool(credentials.get("proxy_url") or stored_global_proxy or settings.binance_proxy) if customer["provider"] == "binance" else False
+        test_result = None
+        if customer["last_test_result"]:
+            try:
+                test_result = json.loads(customer["last_test_result"])
+            except (TypeError, json.JSONDecodeError):
+                test_result = {"ok": False, "message": str(customer["last_test_result"])}
         context = {"customer": dict(customer), "transactions": transactions, "audits": audits,
                    "active_key": dict(active_key) if active_key else None,
                    "active_feed": dict(active_feed) if active_feed else None,
-                   "csrf": session["csrf_token"], "stale": stale, "new_key": None, "feed_url": None}
+                   "csrf": session["csrf_token"], "stale": stale, "new_key": None, "feed_url": None,
+                   "test_result": test_result, "proxy_configured": proxy_configured}
         context.update(secrets_to_show)
         return templates.TemplateResponse(request, "customer.html", context, headers=secret_headers)
 
@@ -180,12 +195,62 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         customers = [dict(row) for row in database.all("SELECT * FROM customers ORDER BY id DESC")]
         return templates.TemplateResponse(request, "dashboard.html", {"customers": customers, "csrf": session["csrf_token"], "now": utcnow()})
 
+    def _global_proxy_value() -> str:
+        encrypted = database.get_setting("binance_proxy")
+        if not encrypted:
+            return settings.binance_proxy
+        try:
+            return crypto.decrypt_string(encrypted).strip()
+        except Exception:
+            return ""
+
+    def _render_proxy(request: Request, session: dict[str, Any], result: dict[str, Any] | None = None):
+        proxy = _global_proxy_value()
+        return templates.TemplateResponse(request, "settings_proxy.html", {
+            "csrf": session["csrf_token"], "proxy_configured": bool(proxy), "result": result,
+        }, headers=secret_headers)
+
+    @app.get("/admin/settings/proxy", response_class=HTMLResponse)
+    def proxy_settings(request: Request, session: dict[str, Any] = Depends(admin_session)):
+        return _render_proxy(request, session)
+
+    @app.post("/admin/settings/proxy")
+    def save_proxy_settings(request: Request, proxy_url: str = Form(""), csrf_token: str = Form(...), session: dict[str, Any] = Depends(admin_session)):
+        csrf(request, session, csrf_token)
+        proxy_url = proxy_url.strip()
+        if proxy_url and not proxy_url.lower().startswith(("http://", "https://", "socks5://", "socks5h://")):
+            raise HTTPException(400, "Proxy URL không hợp lệ")
+        if proxy_url:
+            database.execute("INSERT INTO app_settings(key,value_ciphertext,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value_ciphertext=excluded.value_ciphertext,updated_at=excluded.updated_at", ("binance_proxy", crypto.encrypt_string(proxy_url), utcnow()))
+        else:
+            database.execute("DELETE FROM app_settings WHERE key=?", ("binance_proxy",))
+        database.audit("settings.binance_proxy_updated", None, remote_ip(request), {"configured": bool(proxy_url)})
+        return _render_proxy(request, session, {"ok": True, "message": "Đã lưu cấu hình proxy global"})
+
+    @app.post("/admin/settings/proxy/test")
+    def test_global_proxy(request: Request, csrf_token: str = Form(...), session: dict[str, Any] = Depends(admin_session)):
+        csrf(request, session, csrf_token)
+        proxy = _global_proxy_value()
+        if not proxy:
+            return _render_proxy(request, session, {"ok": False, "message": "Chưa cấu hình proxy global"})
+        started = time.perf_counter()
+        adapter = BinanceAdapter("", "", timeout=settings.binance_timeout_seconds, base_url=settings.binance_base_url, proxy_url=proxy)
+        try:
+            adapter._request("/api/v3/time", {}, signed=False)
+            result = {"ok": True, "message": "Proxy kết nối Binance thành công", "latency_ms": round((time.perf_counter() - started) * 1000)}
+        except Exception as exc:
+            result = {"ok": False, "message": f"{type(exc).__name__}: {str(exc)[:500]}", "latency_ms": round((time.perf_counter() - started) * 1000)}
+        finally:
+            adapter.close()
+        database.audit("settings.binance_proxy_test", None, remote_ip(request), {"ok": bool(result["ok"]), "latency_ms": result["latency_ms"]})
+        return _render_proxy(request, session, result)
+
     @app.post("/admin/customers")
     def create_customer(
         request: Request, name: str = Form(...), account_number: str = Form(...),
         username: str = Form(""), password: str = Form(""), provider: str = Form("acb"),
         channel_type: str = Form(""), api_key: str = Form(""), api_secret: str = Form(""),
-        expires_at: str = Form(""), csrf_token: str = Form(...),
+        proxy_url: str = Form(""), expires_at: str = Form(""), csrf_token: str = Form(...),
         session: dict[str, Any] = Depends(admin_session),
     ):
         csrf(request, session, csrf_token)
@@ -198,7 +263,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(400, "Binance API key/secret là bắt buộc")
             if channel_type not in {None, "all", "pay", "bsc", "trx"}:
                 raise HTTPException(400, "Kênh Binance không hợp lệ")
-            credentials = {"api_key": api_key.strip(), "api_secret": api_secret.strip()}
+            proxy_url = proxy_url.strip()
+            if proxy_url and not proxy_url.lower().startswith(("http://", "https://", "socks5://", "socks5h://")):
+                raise HTTPException(400, "Proxy URL phải bắt đầu bằng http://, https://, socks5:// hoặc socks5h://")
+            credentials = {"api_key": api_key.strip(), "api_secret": api_secret.strip(), "proxy_url": proxy_url}
         else:
             if not username.strip() or not password:
                 raise HTTPException(400, "ACB username/password là bắt buộc")
@@ -217,15 +285,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return render_customer(request, customer_id, session)
 
     @app.post("/admin/customers/{customer_id}/update")
-    def update_customer(request: Request, customer_id: int, name: str = Form(...), account_number: str = Form(...), username: str = Form(""), password: str = Form(""), api_key: str = Form(""), api_secret: str = Form(""), expires_at: str = Form(""), locked: str | None = Form(None), csrf_token: str = Form(...), session: dict[str, Any] = Depends(admin_session)):
+    def update_customer(request: Request, customer_id: int, name: str = Form(...), account_number: str = Form(...), username: str = Form(""), password: str = Form(""), api_key: str = Form(""), api_secret: str = Form(""), proxy_url: str = Form(""), expires_at: str = Form(""), locked: str | None = Form(None), csrf_token: str = Form(...), session: dict[str, Any] = Depends(admin_session)):
         csrf(request, session, csrf_token)
         existing = database.one("SELECT * FROM customers WHERE id=?", (customer_id,))
         if not existing: raise HTTPException(404)
         cipher = existing["credential_ciphertext"]
-        if api_key or api_secret or username or password:
+        if api_key or api_secret or username or password or proxy_url:
             old = crypto.decrypt_json(cipher)
             if existing["provider"] == "binance":
-                cipher = crypto.encrypt_json({"api_key": api_key or old.get("api_key", ""), "api_secret": api_secret or old.get("api_secret", "")})
+                proxy_url = proxy_url.strip()
+                if proxy_url and not proxy_url.lower().startswith(("http://", "https://", "socks5://", "socks5h://")):
+                    raise HTTPException(400, "Proxy URL không hợp lệ")
+                cipher = crypto.encrypt_json({"api_key": api_key or old.get("api_key", ""), "api_secret": api_secret or old.get("api_secret", ""), "proxy_url": proxy_url or old.get("proxy_url", "")})
             else:
                 cipher = crypto.encrypt_json({"username": username or old.get("username", ""), "password": password or old.get("password", "")})
         database.execute("UPDATE customers SET name=?,account_number=?,credential_ciphertext=?,expires_at=?,locked=?,updated_at=? WHERE id=?", (name.strip()[:200], account_number.strip()[:64], cipher, expires_at.strip() or None, 1 if locked else 0, utcnow(), customer_id))
@@ -289,9 +360,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/admin/customers/{customer_id}/test")
     def test_connection(request: Request, customer_id: int, csrf_token: str = Form(...), session: dict[str, Any] = Depends(admin_session)):
         csrf(request, session, csrf_token)
-        if not limiter.allow(f"test:{customer_id}", 1, 60): raise HTTPException(429, "Chỉ test một lần/phút")
-        try: poller.sync_customer(customer_id, force=True)
-        finally: database.audit("customer.connection_test", customer_id, remote_ip(request))
+        if not limiter.allow(f"test:{customer_id}", 1, 60):
+            raise HTTPException(429, "Chỉ test một lần/phút")
+        customer = database.one("SELECT * FROM customers WHERE id=?", (customer_id,))
+        if not customer:
+            raise HTTPException(404)
+        result: dict[str, Any]
+        started = time.perf_counter()
+        try:
+            if customer["provider"] != "binance":
+                poller.sync_customer(customer_id, force=True)
+                result = {"ok": True, "message": "Kết nối ACB thành công", "latency_ms": round((time.perf_counter() - started) * 1000)}
+            else:
+                credentials = crypto.decrypt_json(customer["credential_ciphertext"])
+                adapter = BinanceAdapter(
+                    credentials.get("api_key", ""), credentials.get("api_secret", ""),
+                    timeout=settings.binance_timeout_seconds,
+                    base_url=settings.binance_base_url,
+                    proxy_url=credentials.get("proxy_url", "") or _global_proxy_value(),
+                )
+                try:
+                    result = adapter.test_connection()
+                finally:
+                    adapter.close()
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "message": f"{type(exc).__name__}: {str(exc)[:500]}",
+                "latency_ms": round((time.perf_counter() - started) * 1000),
+            }
+        database.execute("UPDATE customers SET last_test_result=?,last_sync_error=?,updated_at=? WHERE id=?", (json.dumps(result, ensure_ascii=False), None if result.get("ok") else result["message"], utcnow(), customer_id))
+        database.audit("customer.connection_test", customer_id, remote_ip(request), {"ok": bool(result.get("ok")), "latency_ms": result.get("latency_ms")})
         return RedirectResponse(f"/admin/customers/{customer_id}", 303)
 
     def _feed_transactions(customer: dict[str, Any], cursor: int | None, limit: int, kind: str | None = None) -> tuple[list[dict[str, Any]], int | None]:

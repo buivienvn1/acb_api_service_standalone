@@ -61,6 +61,7 @@ class Settings:
     session_ttl_seconds: int
     acb_timeout_seconds: int
     binance_base_url: str = "https://api.binance.com"
+    binance_proxy: str = ""
     binance_timeout_seconds: int = 20
     binance_history_limit: int = 100
     binance_history_days: int = 7
@@ -91,6 +92,7 @@ class Settings:
             session_ttl_seconds=max(300, int(os.getenv("ACB_API_SESSION_TTL_SECONDS", "28800"))),
             acb_timeout_seconds=max(5, int(os.getenv("ACB_API_ACB_TIMEOUT_SECONDS", "20"))),
             binance_base_url=os.getenv("BINANCE_BASE_URL", "https://api.binance.com").rstrip("/"),
+            binance_proxy=os.getenv("BINANCE_PROXY", "").strip(),
             binance_timeout_seconds=max(5, int(os.getenv("BINANCE_REQUEST_TIMEOUT_SECONDS", "20"))),
             binance_history_limit=max(1, min(1000, int(os.getenv("BINANCE_HISTORY_LIMIT", "100")))),
             binance_history_days=max(1, min(30, int(os.getenv("BINANCE_HISTORY_DAYS", "7")))),
@@ -214,6 +216,9 @@ CREATE TABLE IF NOT EXISTS audit_logs (
  id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, action TEXT NOT NULL,
  customer_id INTEGER, remote_ip TEXT, details TEXT NOT NULL DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS app_settings (
+ key TEXT PRIMARY KEY, value_ciphertext TEXT NOT NULL, updated_at TEXT NOT NULL
+);
 """
 
 
@@ -261,6 +266,7 @@ class Database:
             "customers": {
                 "provider": "TEXT NOT NULL DEFAULT 'acb'",
                 "channel_type": "TEXT DEFAULT NULL",
+                "last_test_result": "TEXT DEFAULT NULL",
             },
             "transactions": {
                 "currency": "TEXT NOT NULL DEFAULT 'VND'",
@@ -291,6 +297,10 @@ class Database:
         with self.transaction() as connection:
             cursor = connection.execute(query, params)
             return int(cursor.lastrowid or 0)
+
+    def get_setting(self, key: str) -> str | None:
+        row = self.one("SELECT value_ciphertext FROM app_settings WHERE key=?", (key,))
+        return str(row["value_ciphertext"]) if row else None
 
     def audit(self, action: str, customer_id: int | None, remote_ip: str, details: dict[str, Any] | None = None) -> None:
         safe = details or {}

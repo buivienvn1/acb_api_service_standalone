@@ -64,6 +64,23 @@
             padding: 1rem
         }
 
+        .diagnostic-ok,
+        .diagnostic-error {
+            padding: 1rem;
+            margin: 1rem 0;
+            overflow-wrap: anywhere
+        }
+
+        .diagnostic-ok {
+            background: #dcfce7;
+            border: 1px solid #16a34a
+        }
+
+        .diagnostic-error {
+            background: #fee2e2;
+            border: 1px solid #dc2626
+        }
+
         .key {
             background: #dcfce7;
             padding: 1rem;
@@ -86,7 +103,12 @@
     <h1>{{ customer.name }}</h1>
     <p><strong>Provider:</strong> {{ customer.provider|upper }} · <strong>Kênh:</strong> {{ customer.channel_type or
         ('ACB' if customer.provider == 'acb' else 'ALL') }} · <strong>Tenant:</strong> {{ customer.account_number }}</p>
-    {% if stale %}<p class="warn">Dữ liệu đang stale hoặc chưa đồng bộ. {% if
+    {% if test_result %}<div class="{{ 'diagnostic-ok' if test_result.ok else 'diagnostic-error' }}"><strong>{{ '✅ Kết
+            nối thành công' if test_result.ok else '❌ Kết nối thất bại' }}</strong><br>{{ test_result.message }}{% if
+        test_result.latency_ms is defined %}<br>Độ trễ: {{ test_result.latency_ms }} ms{% endif %}{% if
+        test_result.time_drift_ms is defined %}<br>Lệch giờ: {{ test_result.time_drift_ms }} ms{% endif %}{% if
+        test_result.proxy is defined %}<br>Proxy: {{ 'Đang sử dụng' if test_result.proxy else 'Kết nối trực tiếp' }}{%
+        endif %}</div>{% endif %}{% if stale %}<p class="warn">Dữ liệu đang stale hoặc chưa đồng bộ. {% if
         customer.last_sync_error %}Lần đồng bộ lỗi: {{ customer.last_sync_error }}.{% endif %} Kết quả lịch sử có thể
         chưa đầy đủ.</p>{% endif %}{% if new_key %}<div class="key"><strong>API key chỉ hiển thị trong response
             này:</strong><br><code>{{ new_key }}</code></div>{% endif %}{% if feed_url %}<div class="key"><strong>Feed
@@ -98,12 +120,16 @@
                 required></label><label>Số tài khoản / tenant<input name="account_number"
                 value="{{ customer.account_number }}" required></label>{% if customer.provider == 'binance' %}<label>API
             key mới (để trống giữ nguyên)<input name="api_key" autocomplete="off"></label><label>API secret mới (để
-            trống giữ nguyên)<input type="password" name="api_secret" autocomplete="new-password"></label>{% else
+            trống giữ nguyên)<input type="password" name="api_secret" autocomplete="new-password"></label><label>Proxy
+            URL riêng (để trống giữ nguyên)<input name="proxy_url"
+                placeholder="http://user:pass@host:port hoặc socks5://host:port" autocomplete="off"></label>{% else
         %}<label>Username mới (để trống giữ nguyên)<input name="username" autocomplete="off"></label><label>Password mới
             (để trống giữ nguyên)<input type="password" name="password" autocomplete="new-password"></label>{% endif
         %}<label>Hết hạn<input name="expires_at" value="{{ customer.expires_at or '' }}"></label><label><input
                 type="checkbox" name="locked" value="1" {% if customer.locked %}checked{% endif %}> Khóa dịch
-            vụ</label><button>Lưu cấu hình</button></form>
+            vụ</label>{% if customer.provider == 'binance' %}<p class="muted">Proxy: {{ 'Đang cấu hình' if
+            proxy_configured else 'Chưa cấu hình (kết nối trực tiếp)' }}</p>{% endif %}<button>Lưu cấu hình</button>
+    </form>
     <h2>API key</h2>
     <p>{% if active_key %}Active: <code>{{ active_key.key_prefix }}…</code>, tạo {{ active_key.created_at }}, dùng gần
         nhất {{ active_key.last_used_at or 'chưa dùng' }}{% else %}Chưa có key active.{% endif %}</p>
