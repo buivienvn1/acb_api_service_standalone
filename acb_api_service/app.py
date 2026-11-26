@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import secrets
+import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -11,6 +12,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 
 from acb_api_service.binance_adapter import BinanceAdapter
 from acb_api_service.core import Crypto, Database, Settings, SlidingWindowLimiter, utcnow, verify_password
@@ -18,6 +20,10 @@ from acb_api_service.worker import Poller
 
 
 UTC = timezone.utc
+
+
+class ClaimRequest(BaseModel):
+    transaction_id: str = Field(min_length=1, max_length=256)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -105,14 +111,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database.execute("UPDATE feed_links SET last_used_at=? WHERE id=?", (now, row["feed_id"]))
         return dict(row)
 
+    def authenticate_consumer(
+        authorization: str | None = Header(default=None),
+        x_consumer_key: str | None = Header(default=None, alias="X-Consumer-Key"),
+    ) -> dict[str, Any]:
+        bearer = authorization[7:].strip() if authorization and authorization.lower().startswith("bearer ") else None
+        raw_key = x_consumer_key or bearer
+        if not raw_key or (x_consumer_key and bearer and x_consumer_key != bearer):
+            raise HTTPException(401, "Dùng Authorization: Bearer <consumer_key> hoặc X-Consumer-Key")
+        row = database.one(
+            "SELECT cc.*,c.locked,c.expires_at FROM claim_consumers cc "
+            "JOIN customers c ON c.id=cc.customer_id WHERE cc.key_hash=? AND cc.revoked_at IS NULL",
+            (crypto.hash_api_key(raw_key),),
+        )
+        now = utcnow()
+        if not row:
+            raise HTTPException(401, "Consumer key không hợp lệ")
+        if row["locked"]:
+            raise HTTPException(423, "Tài khoản dịch vụ đang bị khóa")
+        if row["expires_at"] and row["expires_at"] <= now:
+            raise HTTPException(403, "Gói dịch vụ đã hết hạn")
+        if not limiter.allow(f"claim-consumer:{row['id']}", settings.api_rate_limit_per_minute):
+            raise HTTPException(429, "Vượt giới hạn request", headers={"Retry-After": "60"})
+        database.execute("UPDATE claim_consumers SET last_used_at=? WHERE id=?", (now, row["id"]))
+        return dict(row)
+
     def render_customer(request: Request, customer_id: int, session: dict[str, Any], **secrets_to_show: str):
         customer = database.one("SELECT * FROM customers WHERE id=?", (customer_id,))
         if not customer:
             raise HTTPException(404)
         transactions = []
         for row in database.all(
-            "SELECT * FROM transactions WHERE customer_id=? "
-            "ORDER BY COALESCE(transacted_at,created_at) DESC,id DESC LIMIT 100",
+            "SELECT t.*,tc.claimed_at,cc.name claimed_by FROM transactions t "
+            "LEFT JOIN transaction_claims tc ON tc.transaction_id=t.id "
+            "LEFT JOIN claim_consumers cc ON cc.id=tc.consumer_id WHERE t.customer_id=? "
+            "ORDER BY COALESCE(t.transacted_at,t.created_at) DESC,t.id DESC LIMIT 100",
             (customer_id,),
         ):
             transaction = dict(row)
@@ -129,6 +162,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 transaction.update({"network": "", "address": ""})
             transactions.append(transaction)
         audits = [dict(row) for row in database.all("SELECT * FROM audit_logs WHERE customer_id=? ORDER BY id DESC LIMIT 50", (customer_id,))]
+        consumers = [dict(row) for row in database.all("SELECT id,name,key_prefix,created_at,revoked_at,last_used_at FROM claim_consumers WHERE customer_id=? ORDER BY id DESC", (customer_id,))]
+        claims = [dict(row) for row in database.all(
+            "SELECT tc.claimed_at,t.external_id,t.amount,t.currency,t.transaction_type,cc.name consumer_name "
+            "FROM transaction_claims tc JOIN transactions t ON t.id=tc.transaction_id "
+            "JOIN claim_consumers cc ON cc.id=tc.consumer_id WHERE t.customer_id=? ORDER BY tc.id DESC LIMIT 100",
+            (customer_id,),
+        )]
         active_key = database.one("SELECT key_prefix,created_at,last_used_at FROM api_keys WHERE customer_id=? AND revoked_at IS NULL", (customer_id,))
         active_feed = database.one("SELECT token_prefix,created_at,last_used_at FROM feed_links WHERE customer_id=? AND revoked_at IS NULL", (customer_id,))
         stale = not customer["last_sync_ok_at"] or (datetime.fromisoformat(customer["last_sync_ok_at"]) < datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=settings.stale_after_seconds))
@@ -150,9 +190,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             except (TypeError, json.JSONDecodeError):
                 test_result = {"ok": False, "message": str(customer["last_test_result"])}
         context = {"customer": dict(customer), "transactions": transactions, "audits": audits,
+                   "consumers": consumers, "claims": claims,
                    "active_key": dict(active_key) if active_key else None,
                    "active_feed": dict(active_feed) if active_feed else None,
-                   "csrf": session["csrf_token"], "stale": stale, "new_key": None, "feed_url": None,
+                   "csrf": session["csrf_token"], "stale": stale, "new_key": None, "new_consumer_key": None, "feed_url": None,
                    "test_result": test_result, "proxy_configured": proxy_configured,
                    "global_proxy_disabled": global_proxy_disabled}
         context.update(secrets_to_show)
@@ -384,6 +425,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database.audit("feed_link.revoked", customer_id, remote_ip(request))
         return RedirectResponse(f"/admin/customers/{customer_id}", 303)
 
+    @app.post("/admin/customers/{customer_id}/consumers")
+    def create_consumer(request: Request, customer_id: int, name: str = Form(...), csrf_token: str = Form(...), session: dict[str, Any] = Depends(admin_session)):
+        csrf(request, session, csrf_token)
+        name = name.strip()[:100]
+        if not name:
+            raise HTTPException(400, "Tên bot là bắt buộc")
+        if not database.one("SELECT 1 FROM customers WHERE id=?", (customer_id,)):
+            raise HTTPException(404)
+        raw = crypto.new_consumer_key()
+        database.execute(
+            "INSERT INTO claim_consumers(customer_id,name,key_prefix,key_hash,created_at) VALUES(?,?,?,?,?)",
+            (customer_id, name, raw[:18], crypto.hash_api_key(raw), utcnow()),
+        )
+        database.audit("claim_consumer.created", customer_id, remote_ip(request), {"name": name})
+        return render_customer(request, customer_id, session, new_consumer_key=raw)
+
+    @app.post("/admin/customers/{customer_id}/consumers/{consumer_id}/revoke")
+    def revoke_consumer(request: Request, customer_id: int, consumer_id: int, csrf_token: str = Form(...), session: dict[str, Any] = Depends(admin_session)):
+        csrf(request, session, csrf_token)
+        row = database.one("SELECT id,name FROM claim_consumers WHERE id=? AND customer_id=?", (consumer_id, customer_id))
+        if not row:
+            raise HTTPException(404)
+        database.execute("UPDATE claim_consumers SET revoked_at=? WHERE id=? AND revoked_at IS NULL", (utcnow(), consumer_id))
+        database.audit("claim_consumer.revoked", customer_id, remote_ip(request), {"name": row["name"]})
+        return RedirectResponse(f"/admin/customers/{customer_id}", 303)
+
     @app.post("/admin/customers/{customer_id}/test")
     def test_connection(request: Request, customer_id: int, csrf_token: str = Form(...), session: dict[str, Any] = Depends(admin_session)):
         csrf(request, session, csrf_token)
@@ -421,21 +488,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return RedirectResponse(f"/admin/customers/{customer_id}", 303)
 
     def _feed_transactions(customer: dict[str, Any], cursor: int | None, limit: int, kind: str | None = None) -> tuple[list[dict[str, Any]], int | None]:
-        clauses, params = ["customer_id=?"], [customer["id"]]
+        clauses, params = ["t.customer_id=?"], [customer["id"]]
         if kind:
             transaction_type = {"pay": "BINANCE_PAY", "bsc": "BINANCE_BSC_DEPOSIT", "trx": "BINANCE_TRX_DEPOSIT"}.get(kind)
             if not transaction_type:
                 raise HTTPException(404, "Feed not found")
-            clauses.append("transaction_type=?")
+            clauses.append("t.transaction_type=?")
             params.append(transaction_type)
         if cursor:
             cursor_row = database.one("SELECT id,COALESCE(transacted_at,created_at) sort_at FROM transactions WHERE id=? AND customer_id=?", (cursor, customer["id"]))
             if not cursor_row:
                 raise HTTPException(400, "Cursor không hợp lệ")
-            clauses.append("(COALESCE(transacted_at,created_at)<? OR (COALESCE(transacted_at,created_at)=? AND id<?))")
+            clauses.append("(COALESCE(t.transacted_at,t.created_at)<? OR (COALESCE(t.transacted_at,t.created_at)=? AND t.id<?))")
             params.extend((cursor_row["sort_at"], cursor_row["sort_at"], cursor_row["id"]))
         params.append(limit + 1)
-        rows = database.all(f"SELECT id,external_id,amount,description,transaction_type,transacted_at,raw_json,currency,extra_meta FROM transactions WHERE {' AND '.join(clauses)} ORDER BY COALESCE(transacted_at,created_at) DESC,id DESC LIMIT ?", tuple(params))
+        rows = database.all(
+            f"SELECT t.id,t.external_id,t.amount,t.description,t.transaction_type,t.transacted_at,t.raw_json,t.currency,t.extra_meta,"
+            f"tc.claimed_at,cc.name claimed_by FROM transactions t "
+            f"LEFT JOIN transaction_claims tc ON tc.transaction_id=t.id "
+            f"LEFT JOIN claim_consumers cc ON cc.id=tc.consumer_id WHERE {' AND '.join(clauses)} "
+            f"ORDER BY COALESCE(t.transacted_at,t.created_at) DESC,t.id DESC LIMIT ?",
+            tuple(params),
+        )
         more, rows = len(rows) > limit, rows[:limit]
         transactions = []
         for row in rows:
@@ -445,7 +519,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raw = {}
             if not isinstance(raw, dict):
                 raw = {}
-            item = {"transactionNumber": row["external_id"], "transactionID": row["external_id"], "amount": row["amount"], "description": row["description"], "transactionDate": raw.get("transactionDate") or row["transacted_at"] or "", "type": row["transaction_type"], "currency": row["currency"]}
+            item = {"transactionNumber": row["external_id"], "transactionID": row["external_id"], "amount": row["amount"], "description": row["description"], "transactionDate": raw.get("transactionDate") or row["transacted_at"] or "", "type": row["transaction_type"], "currency": row["currency"], "claimed": bool(row["claimed_at"]), "claimed_by": row["claimed_by"]}
             try:
                 extra_meta = json.loads(row["extra_meta"] or "{}")
             except (TypeError, json.JSONDecodeError):
@@ -487,6 +561,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         customer = _authenticate_legacy_binance(tenant_id, token)
         transactions, next_cursor = _feed_transactions(customer, None, limit, kind)
         return {"status": "success", "tenant_id": tenant_id, "feed": kind, "transactions": transactions, "updated_at": customer["last_sync_at"], "next_cursor": next_cursor, "stale": not customer["last_sync_ok_at"], "last_error": customer["last_sync_error"]}
+
+    @app.post("/api/v1/claims")
+    def claim_transaction(payload: ClaimRequest, consumer: dict[str, Any] = Depends(authenticate_consumer)):
+        external_id = payload.transaction_id.strip()
+        if not external_id:
+            raise HTTPException(422, "transaction_id là bắt buộc")
+        now = utcnow()
+        with database.transaction() as connection:
+            transaction = connection.execute(
+                "SELECT id FROM transactions WHERE customer_id=? AND external_id=?",
+                (consumer["customer_id"], external_id),
+            ).fetchone()
+            if not transaction:
+                raise HTTPException(404, "Transaction not found")
+            existing = connection.execute(
+                "SELECT tc.consumer_id,cc.name FROM transaction_claims tc "
+                "JOIN claim_consumers cc ON cc.id=tc.consumer_id WHERE tc.transaction_id=?",
+                (transaction["id"],),
+            ).fetchone()
+            if existing:
+                payload_out = {"transaction_id": external_id, "claimed": True, "claimed_by": existing["name"]}
+                if existing["consumer_id"] == consumer["id"]:
+                    return payload_out
+                return JSONResponse(payload_out, status_code=409)
+            try:
+                connection.execute(
+                    "INSERT INTO transaction_claims(transaction_id,consumer_id,claimed_at) VALUES(?,?,?)",
+                    (transaction["id"], consumer["id"], now),
+                )
+            except sqlite3.IntegrityError:
+                winner = connection.execute(
+                    "SELECT cc.name FROM transaction_claims tc JOIN claim_consumers cc ON cc.id=tc.consumer_id "
+                    "WHERE tc.transaction_id=?",
+                    (transaction["id"],),
+                ).fetchone()
+                return JSONResponse({"transaction_id": external_id, "claimed": True, "claimed_by": winner["name"] if winner else None}, status_code=409)
+        return {"transaction_id": external_id, "claimed": True, "claimed_by": consumer["name"]}
 
     @app.get("/api/v1/{tenant_id}/status")
     def legacy_binance_status(tenant_id: str, token: str = Query(..., min_length=32)):

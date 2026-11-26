@@ -38,6 +38,34 @@ https://your-domain.example/api/v1/<tenant_id>/status?token=<feed_token>
 
 Trong đó `kind` là `pay`, `bsc` hoặc `trx`. Không đặt API secret vào URL, query log hoặc mã nguồn.
 
+## Chống sử dụng lại giao dịch giữa nhiều bot
+
+Mỗi giao dịch trong feed có thêm `claimed` và `claimed_by`. `claimed: false` chỉ để tham khảo; trước khi cộng tiền hoặc giao hàng, bot bắt buộc phải claim nguyên tử qua API trung tâm.
+
+Tạo một consumer key riêng cho từng bot trong trang chi tiết khách hàng. Key chỉ hiển thị một lần và phải được lưu như secret. Bot gửi đúng `transactionID` lấy từ feed:
+
+```bash
+curl -X POST https://your-domain.example/api/v1/claims \
+  -H "Authorization: Bearer <consumer_key>" \
+  -H "Content-Type: application/json" \
+  -d '{"transaction_id":"TX123"}'
+```
+
+Quy ước phản hồi:
+
+- HTTP `200`, `claimed: true`: bot hiện tại đã claim thành công, hoặc chính bot này đang retry giao dịch đã claim trước đó. Bot được phép hoàn tất đơn.
+- HTTP `409`, `claimed: true`: một bot khác đã claim giao dịch. Bot không được hoàn tất đơn.
+- HTTP `404`: giao dịch không tồn tại trong tenant gắn với consumer key.
+- HTTP `401`: consumer key sai hoặc đã bị thu hồi.
+
+Ví dụ thành công:
+
+```json
+{"transaction_id":"TX123","claimed":true,"claimed_by":"bot-a"}
+```
+
+Bot không được chỉ dựa vào `claimed: false` trong feed vì hai bot có thể đọc cùng lúc. Quyền sử dụng giao dịch được quyết định duy nhất bởi kết quả của `POST /api/v1/claims`.
+
 ## Chạy thử
 
 ```bash

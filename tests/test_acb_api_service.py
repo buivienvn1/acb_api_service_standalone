@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 import tempfile
 import unittest
@@ -121,6 +122,14 @@ class ACBAPIServiceTest(unittest.TestCase):
         )
         return raw
 
+    def _consumer(self, customer_id, name):
+        raw = self.crypto.new_consumer_key()
+        self.db.execute(
+            "INSERT INTO claim_consumers(customer_id,name,key_prefix,key_hash,created_at) VALUES(?,?,?,?,?)",
+            (customer_id, name, raw[:18], self.crypto.hash_api_key(raw), utcnow()),
+        )
+        return raw
+
     def _app_client(self):
         with patch.dict(os.environ, {
             "ACB_API_ENCRYPTION_KEY": self.settings.encryption_key,
@@ -141,11 +150,39 @@ class ACBAPIServiceTest(unittest.TestCase):
         Database(self.settings.database_path)
         columns = {row["name"] for row in self.db.all("PRAGMA table_info(feed_links)")}
         self.assertTrue({"token_hash", "token_ciphertext", "token_prefix", "created_at", "revoked_at", "last_used_at"} <= columns)
+        self.assertIsNotNone(self.db.one("SELECT name FROM sqlite_master WHERE type='table' AND name='claim_consumers'"))
+        self.assertIsNotNone(self.db.one("SELECT name FROM sqlite_master WHERE type='table' AND name='transaction_claims'"))
         raw = self._feed(self.customer_ids[0])
         row = self.db.one("SELECT * FROM feed_links WHERE customer_id=?", (self.customer_ids[0],))
         self.assertNotIn(raw, row["token_ciphertext"])
         self.assertNotEqual(raw, row["token_hash"])
         self.assertEqual(Crypto(self.settings.encryption_key, "restart-secret").decrypt_string(row["token_ciphertext"]), raw)
+
+    def test_migration_repairs_shifted_binance_transaction_columns(self):
+        raw = {
+            "transactionNumber": "bsc-corrupt",
+            "currency": "USDT",
+            "network": "BSC",
+            "address": "0x123",
+            "status": "PENDING",
+        }
+        shifted_meta = json.dumps({"network": "BSC", "address": "0x123", "status": "PENDING"})
+        timestamp = "2026-01-02T03:04:05+00:00"
+        self.db.execute(
+            "INSERT INTO transactions(customer_id,external_id,amount,transaction_type,raw_json,created_at,currency,extra_meta) VALUES(?,?,?,?,?,?,?,?)",
+            (self.customer_ids[0], "bsc-corrupt", 5, "BINANCE_BSC_DEPOSIT", json.dumps(raw), "USDT", shifted_meta, timestamp),
+        )
+
+        Database(self.settings.database_path)
+        row = self.db.one("SELECT created_at,currency,extra_meta FROM transactions WHERE external_id='bsc-corrupt'")
+        self.assertEqual(row["created_at"], timestamp)
+        self.assertEqual(row["currency"], "USDT")
+        self.assertEqual(json.loads(row["extra_meta"]), {"network": "BSC", "address": "0x123", "status": "PENDING"})
+
+        # The repair is safe to run repeatedly.
+        Database(self.settings.database_path)
+        row_again = self.db.one("SELECT created_at,currency,extra_meta FROM transactions WHERE external_id='bsc-corrupt'")
+        self.assertEqual(dict(row_again), dict(row))
 
     def test_worker_scheduler_checks_due_customers_every_five_seconds(self):
         poller = Poller(self.settings, self.db, self.crypto, FakeAdapter)
@@ -161,6 +198,10 @@ class ACBAPIServiceTest(unittest.TestCase):
         Poller(self.settings, self.db, self.crypto, FakeAdapter).sync_customer(self.customer_ids[0], force=True)
         count = self.db.one("SELECT COUNT(*) count FROM transactions WHERE customer_id=?", (self.customer_ids[0],))["count"]
         self.assertEqual(count, 1)
+        transaction = self.db.one("SELECT created_at,currency,extra_meta FROM transactions WHERE customer_id=?", (self.customer_ids[0],))
+        datetime.fromisoformat(transaction["created_at"])
+        self.assertEqual(transaction["currency"], "VND")
+        self.assertEqual(json.loads(transaction["extra_meta"]), {})
         FakeAdapter.fail = True
         with self.assertRaises(RuntimeError):
             Poller(self.settings, self.db, self.crypto, FakeAdapter).sync_customer(self.customer_ids[0], force=True)
@@ -332,6 +373,49 @@ class ACBAPIServiceTest(unittest.TestCase):
         self.assertEqual(client.get(f"/api/v1/binance-001/status?token={feed}").status_code, 200)
         self.assertEqual(client.get(f"/api/v1/binance-001/pay/feed?token={'x' * 32}").status_code, 404)
         self.assertIsNotNone(self.db.one("SELECT last_used_at FROM feed_links WHERE customer_id=?", (customer_id,))["last_used_at"])
+
+    def test_consumer_claim_is_atomic_idempotent_tenant_scoped_and_visible_in_feed(self):
+        customer_id = self.customer_ids[0]
+        other_customer_id = self.customer_ids[1]
+        now = utcnow()
+        self.db.execute("UPDATE customers SET last_sync_at=?,last_sync_ok_at=? WHERE id=?", (now, now, customer_id))
+        self.db.execute(
+            "INSERT INTO transactions(customer_id,external_id,amount,description,transaction_type,transacted_at,raw_json,created_at,currency) VALUES(?,?,?,?,?,?,?,?,?)",
+            (customer_id, "CLAIM-1", 100, "Payment", "BINANCE_PAY", now, "{}", now, "USDT"),
+        )
+        feed = self._feed(customer_id)
+        bot_a = self._consumer(customer_id, "bot-a")
+        bot_b = self._consumer(customer_id, "bot-b")
+        other_bot = self._consumer(other_customer_id, "other-bot")
+        stored = self.db.one("SELECT key_hash,key_prefix FROM claim_consumers WHERE name='bot-a'")
+        self.assertNotEqual(stored["key_hash"], bot_a)
+        self.assertTrue(bot_a.startswith(stored["key_prefix"]))
+
+        client = self._app_client()
+        before = client.get(f"/api/v1/feed?token={feed}").json()["transactions"][0]
+        self.assertIs(before["claimed"], False)
+        self.assertIsNone(before["claimed_by"])
+
+        claimed = client.post("/api/v1/claims", headers={"Authorization": f"Bearer {bot_a}"}, json={"transaction_id": "CLAIM-1"})
+        self.assertEqual(claimed.status_code, 200)
+        self.assertEqual(claimed.json(), {"transaction_id": "CLAIM-1", "claimed": True, "claimed_by": "bot-a"})
+        retry = client.post("/api/v1/claims", headers={"X-Consumer-Key": bot_a}, json={"transaction_id": "CLAIM-1"})
+        self.assertEqual(retry.status_code, 200)
+        conflict = client.post("/api/v1/claims", headers={"Authorization": f"Bearer {bot_b}"}, json={"transaction_id": "CLAIM-1"})
+        self.assertEqual(conflict.status_code, 409)
+        self.assertEqual(conflict.json()["claimed_by"], "bot-a")
+        self.assertEqual(len(self.db.all("SELECT * FROM transaction_claims")), 1)
+
+        cross_tenant = client.post("/api/v1/claims", headers={"Authorization": f"Bearer {other_bot}"}, json={"transaction_id": "CLAIM-1"})
+        self.assertEqual(cross_tenant.status_code, 404)
+        after = client.get(f"/api/v1/feed?token={feed}").json()["transactions"][0]
+        self.assertIs(after["claimed"], True)
+        self.assertEqual(after["claimed_by"], "bot-a")
+
+        bot_a_id = self.db.one("SELECT id FROM claim_consumers WHERE name='bot-a'")["id"]
+        self.db.execute("UPDATE claim_consumers SET revoked_at=? WHERE id=?", (utcnow(), bot_a_id))
+        revoked = client.post("/api/v1/claims", headers={"Authorization": f"Bearer {bot_a}"}, json={"transaction_id": "CLAIM-1"})
+        self.assertEqual(revoked.status_code, 401)
 
     def test_feed_expiry_and_cross_tenant_data_isolation(self):
         Poller(self.settings, self.db, self.crypto, FakeAdapter).sync_customer(self.customer_ids[0], force=True)

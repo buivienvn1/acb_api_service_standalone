@@ -45,6 +45,21 @@ class BinanceAdapterTests(unittest.TestCase):
         self.assertEqual(normalized["type"], "BINANCE_BSC_DEPOSIT")
         self.assertEqual(normalized["status"], "SUCCESS")
 
+    def test_deposit_status_codes_are_normalized(self) -> None:
+        expected = {
+            0: "PENDING",
+            1: "SUCCESS",
+            6: "CREDITED",
+            7: "WRONG_DEPOSIT",
+            8: "WAITING_CONFIRMATION",
+            99: "99",
+            None: "UNKNOWN",
+        }
+        for status_code, status in expected.items():
+            with self.subTest(status_code=status_code):
+                normalized = self.adapter._normalize_deposit({"txId": "tx", "status": status_code}, "trx")
+                self.assertEqual(normalized["status"], status)
+
     @patch("acb_api_service.binance_adapter.time.time", return_value=100.0)
     def test_signed_request_adds_timestamp_signature_and_api_key(self, _time: Mock) -> None:
         response = Mock(status_code=200)

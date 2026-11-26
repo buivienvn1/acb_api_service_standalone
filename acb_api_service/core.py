@@ -142,6 +142,10 @@ class Crypto:
         prefix = "binance_feed_" if provider.lower() == "binance" else "acb_feed_"
         return prefix + secrets.token_urlsafe(48)
 
+    @staticmethod
+    def new_consumer_key() -> str:
+        return "consumer_live_" + secrets.token_urlsafe(32)
+
     def sign(self, value: str) -> str:
         return hmac.new(self.session_secret, value.encode(), hashlib.sha256).hexdigest()
 
@@ -210,6 +214,19 @@ CREATE TABLE IF NOT EXISTS transactions (
  UNIQUE(customer_id, external_id)
 );
 CREATE INDEX IF NOT EXISTS transactions_customer_cursor ON transactions(customer_id, id DESC);
+CREATE TABLE IF NOT EXISTS claim_consumers (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+ name TEXT NOT NULL, key_prefix TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE,
+ created_at TEXT NOT NULL, revoked_at TEXT, last_used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS claim_consumers_customer ON claim_consumers(customer_id, id DESC);
+CREATE TABLE IF NOT EXISTS transaction_claims (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ transaction_id INTEGER NOT NULL UNIQUE REFERENCES transactions(id) ON DELETE CASCADE,
+ consumer_id INTEGER NOT NULL REFERENCES claim_consumers(id) ON DELETE RESTRICT,
+ claimed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS transaction_claims_consumer ON transaction_claims(consumer_id, id DESC);
 CREATE TABLE IF NOT EXISTS admin_sessions (
  id TEXT PRIMARY KEY, csrf_token TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
  revoked_at INTEGER
@@ -280,6 +297,45 @@ class Database:
             for name, definition in columns.items():
                 if name not in existing:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        Database._repair_shifted_transactions(connection)
+
+    @staticmethod
+    def _repair_shifted_transactions(connection: sqlite3.Connection) -> None:
+        """Repair rows written with currency/metadata/timestamp shifted one column left."""
+        rows = connection.execute(
+            "SELECT id,transaction_type,transacted_at,raw_json,created_at,currency,extra_meta "
+            "FROM transactions WHERE currency LIKE '{%'"
+        ).fetchall()
+        for row in rows:
+            try:
+                shifted_metadata = json.loads(row["currency"])
+                raw = json.loads(row["raw_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(shifted_metadata, dict) or not isinstance(raw, dict):
+                continue
+            try:
+                datetime.fromisoformat(str(row["extra_meta"]).replace("Z", "+00:00"))
+                repaired_created_at = str(row["extra_meta"])
+            except (TypeError, ValueError):
+                repaired_created_at = row["transacted_at"] or utcnow()
+            tx_type = str(row["transaction_type"] or "")
+            fallback_currency = "USDT" if tx_type == "BINANCE_BSC_DEPOSIT" else "TRX" if tx_type == "BINANCE_TRX_DEPOSIT" else "VND"
+            repaired_currency = str(raw.get("currency") or fallback_currency).upper()[:16]
+            metadata = {
+                key: raw[key]
+                for key in ("network", "address", "orderId", "status", "payerInfo")
+                if key in raw
+            }
+            connection.execute(
+                "UPDATE transactions SET created_at=?,currency=?,extra_meta=? WHERE id=?",
+                (
+                    repaired_created_at,
+                    repaired_currency,
+                    json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+                    row["id"],
+                ),
+            )
 
     def one(self, query: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
         connection = self.connect()

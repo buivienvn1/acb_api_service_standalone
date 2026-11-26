@@ -135,6 +135,14 @@ class BinanceAdapter:
 
     @staticmethod
     def _normalize_deposit(row: dict[str, Any], kind: str) -> dict[str, Any]:
+        status_code = str(row.get("status")) if row.get("status") is not None else ""
+        status = {
+            "0": "PENDING",
+            "1": "SUCCESS",
+            "6": "CREDITED",
+            "7": "WRONG_DEPOSIT",
+            "8": "WAITING_CONFIRMATION",
+        }.get(status_code, status_code or "UNKNOWN")
         return {
             "transactionNumber": str(row.get("txId") or row.get("id") or row.get("insertTime") or ""),
             "amount": row.get("amount", 0),
@@ -144,6 +152,6 @@ class BinanceAdapter:
             "currency": "USDT" if kind == "bsc" else "TRX",
             "network": row.get("network") or ("BSC" if kind == "bsc" else "TRX"),
             "address": row.get("address") or "",
-            "status": "SUCCESS" if str(row.get("status")) == "1" else str(row.get("status") or "UNKNOWN"),
+            "status": status,
             "raw": row,
         }

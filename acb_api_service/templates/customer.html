@@ -111,7 +111,9 @@
         endif %}</div>{% endif %}{% if stale %}<p class="warn">Dữ liệu đang stale hoặc chưa đồng bộ. {% if
         customer.last_sync_error %}Lần đồng bộ lỗi: {{ customer.last_sync_error }}.{% endif %} Kết quả lịch sử có thể
         chưa đầy đủ.</p>{% endif %}{% if new_key %}<div class="key"><strong>API key chỉ hiển thị trong response
-            này:</strong><br><code>{{ new_key }}</code></div>{% endif %}{% if feed_url %}<div class="key"><strong>Feed
+            này:</strong><br><code>{{ new_key }}</code></div>{% endif %}{% if new_consumer_key %}<div class="key">
+        <strong>Consumer key chỉ hiển thị lần này — hãy lưu vào bot:</strong><br><code>{{ new_consumer_key }}</code>
+    </div>{% endif %}{% if feed_url %}<div class="key"><strong>Feed
             link bí mật:</strong><br><input id="feed-url" readonly value="{{ feed_url }}"><button type="button"
             onclick="navigator.clipboard.writeText(document.getElementById('feed-url').value)">Copy link</button></div>
     {% endif %}<h2>Cấu hình</h2>
@@ -155,6 +157,60 @@
         <form method="post" action="/admin/customers/{{ customer.id }}/feed/revoke"><input type="hidden"
                 name="csrf_token" value="{{ csrf }}"><button class="danger">Revoke link</button></form>{% endif %}
     </div>
+    <h2>Bot claim giao dịch</h2>
+    <form class="grid" method="post" action="/admin/customers/{{ customer.id }}/consumers"><input type="hidden"
+            name="csrf_token" value="{{ csrf }}"><label>Tên bot / consumer<input name="name" maxlength="100"
+                placeholder="Ví dụ: bot-a" required></label><button>Tạo consumer key</button></form>
+    <table>
+        <thead>
+            <tr>
+                <th>Tên bot</th>
+                <th>Key prefix</th>
+                <th>Ngày tạo</th>
+                <th>Dùng gần nhất</th>
+                <th>Trạng thái</th>
+                <th>Thao tác</th>
+            </tr>
+        </thead>
+        <tbody>{% for consumer in consumers %}<tr>
+                <td>{{ consumer.name }}</td>
+                <td><code>{{ consumer.key_prefix }}…</code></td>
+                <td>{{ consumer.created_at }}</td>
+                <td>{{ consumer.last_used_at or 'chưa dùng' }}</td>
+                <td>{{ 'Đã thu hồi' if consumer.revoked_at else 'Active' }}</td>
+                <td>{% if not consumer.revoked_at %}
+                    <form method="post" action="/admin/customers/{{ customer.id }}/consumers/{{ consumer.id }}/revoke">
+                        <input type="hidden" name="csrf_token" value="{{ csrf }}"><button class="danger">Thu
+                            hồi</button>
+                    </form>{% endif %}
+                </td>
+            </tr>{% else %}<tr>
+                <td colspan="6">Chưa có consumer key.</td>
+            </tr>{% endfor %}</tbody>
+    </table>
+    <h2>Lịch sử claim</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Thời gian</th>
+                <th>Mã giao dịch</th>
+                <th>Bot</th>
+                <th>Số tiền</th>
+                <th>Tiền tệ</th>
+                <th>Loại</th>
+            </tr>
+        </thead>
+        <tbody>{% for claim in claims %}<tr>
+                <td>{{ claim.claimed_at }}</td>
+                <td>{{ claim.external_id }}</td>
+                <td>{{ claim.consumer_name }}</td>
+                <td>{{ claim.amount }}</td>
+                <td>{{ claim.currency }}</td>
+                <td>{{ claim.transaction_type }}</td>
+            </tr>{% else %}<tr>
+                <td colspan="6">Chưa có giao dịch được claim.</td>
+            </tr>{% endfor %}</tbody>
+    </table>
     <h2>Giao dịch gần nhất</h2>
     <table>
         <thead>
@@ -166,6 +222,8 @@
                 <th>Loại</th>
                 <th>Mạng</th>
                 <th>Thời gian</th>
+                <th>Claimed</th>
+                <th>Bot</th>
                 <th>Nội dung</th>
             </tr>
         </thead>
@@ -177,9 +235,11 @@
                 <td>{{ tx.transaction_type }}</td>
                 <td>{{ tx.network or '' }}</td>
                 <td>{{ tx.transacted_at }}</td>
+                <td>{{ 'Có' if tx.claimed_at else 'Chưa' }}</td>
+                <td>{{ tx.claimed_by or '' }}</td>
                 <td>{{ tx.description }}</td>
             </tr>{% else %}<tr>
-                <td colspan="8">Chưa có dữ liệu.</td>
+                <td colspan="10">Chưa có dữ liệu.</td>
             </tr>{% endfor %}</tbody>
     </table>
     <h2>Audit log</h2>

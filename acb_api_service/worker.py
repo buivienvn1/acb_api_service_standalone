@@ -120,10 +120,10 @@ class Poller:
             inserted = 0
             with self.database.transaction() as connection:
                 for item in rows:
-                    values = normalize_transaction(item)
+                    external_id, amount, description, tx_type, transacted_at, raw_json, currency, extra_meta = normalize_transaction(item)
                     cursor = connection.execute(
                         "INSERT OR IGNORE INTO transactions(customer_id,external_id,amount,description,transaction_type,transacted_at,raw_json,created_at,currency,extra_meta) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (customer_id, *values, now),
+                        (customer_id, external_id, amount, description, tx_type, transacted_at, raw_json, now, currency, extra_meta),
                     )
                     inserted += cursor.rowcount
                 connection.execute(
