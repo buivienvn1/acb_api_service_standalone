@@ -126,6 +126,12 @@ class Poller:
                         (customer_id, external_id, amount, description, tx_type, transacted_at, raw_json, now, currency, extra_meta),
                     )
                     inserted += cursor.rowcount
+                    if cursor.rowcount == 0:
+                        connection.execute(
+                            "UPDATE transactions SET amount=?,description=?,transaction_type=?,transacted_at=?,raw_json=?,currency=?,extra_meta=? "
+                            "WHERE customer_id=? AND external_id=?",
+                            (amount, description, tx_type, transacted_at, raw_json, currency, extra_meta, customer_id, external_id),
+                        )
                 connection.execute(
                     "UPDATE customers SET last_sync_at=?,last_sync_ok_at=?,last_sync_error=NULL,failure_count=0,next_sync_at=?,updated_at=? WHERE id=?",
                     (now, now, (datetime.now(UTC) + timedelta(seconds=self.settings.poll_interval_seconds)).isoformat(timespec="seconds"), now, customer_id),

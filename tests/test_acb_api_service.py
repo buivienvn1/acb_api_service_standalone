@@ -209,6 +209,55 @@ class ACBAPIServiceTest(unittest.TestCase):
         self.assertEqual(state["last_sync_error"], "RuntimeError")
         self.assertEqual(state["failure_count"], 1)
 
+    def test_worker_refreshes_existing_status_without_replacing_id_or_claim(self):
+        class ChangingStatusAdapter:
+            status = "PENDING"
+
+            def __init__(self, username, password, account_number, timeout=20):
+                pass
+
+            def fetch_transactions(self, rows=200, days_back=3):
+                return [{
+                    "transactionNumber": "BSC-STATUS-1",
+                    "amount": "1.002",
+                    "type": "BINANCE_BSC_DEPOSIT",
+                    "timestamp": 1_795_745_582_000,
+                    "currency": "USDT",
+                    "network": "BSC",
+                    "address": "0x123",
+                    "status": type(self).status,
+                }]
+
+            def close(self):
+                pass
+
+        customer_id = self.customer_ids[0]
+        poller = Poller(self.settings, self.db, self.crypto, ChangingStatusAdapter)
+        self.assertEqual(poller.sync_customer(customer_id, force=True), 1)
+        pending = self.db.one(
+            "SELECT id,created_at,extra_meta FROM transactions WHERE customer_id=? AND external_id=?",
+            (customer_id, "BSC-STATUS-1"),
+        )
+        consumer_key = self._consumer(customer_id, "status-bot")
+        consumer = self.db.one("SELECT id FROM claim_consumers WHERE key_hash=?", (self.crypto.hash_api_key(consumer_key),))
+        self.db.execute(
+            "INSERT INTO transaction_claims(transaction_id,consumer_id,claimed_at) VALUES(?,?,?)",
+            (pending["id"], consumer["id"], utcnow()),
+        )
+
+        ChangingStatusAdapter.status = "SUCCESS"
+        self.assertEqual(poller.sync_customer(customer_id, force=True), 0)
+        refreshed = self.db.one(
+            "SELECT id,created_at,raw_json,extra_meta FROM transactions WHERE customer_id=? AND external_id=?",
+            (customer_id, "BSC-STATUS-1"),
+        )
+        self.assertEqual(refreshed["id"], pending["id"])
+        self.assertEqual(refreshed["created_at"], pending["created_at"])
+        self.assertEqual(json.loads(refreshed["extra_meta"])["status"], "SUCCESS")
+        self.assertEqual(json.loads(refreshed["raw_json"])["status"], "SUCCESS")
+        claim = self.db.one("SELECT transaction_id FROM transaction_claims WHERE transaction_id=?", (pending["id"],))
+        self.assertEqual(claim["transaction_id"], pending["id"])
+
     def test_api_tenant_isolation_rotation_expiry_and_stale(self):
         poller = Poller(self.settings, self.db, self.crypto, FakeAdapter)
         poller.sync_customer(self.customer_ids[0], force=True)
